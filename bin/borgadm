@@ -813,7 +813,11 @@ class RunningCmd:
     remote repository -- gets an ssh log of its own: ssh logs at debug
     level to a fresh file, and a failure message ends with the tail of
     that log. With a log file ssh writes its own errors there instead of
-    to stderr, so the tail is also where those appear."""
+    to stderr, so the tail is also where those appear.
+
+    A command can carry a monitor: a callback run in a thread of its own
+    alongside it, from `start_monitor()` until `stop_monitor()`, which
+    waiting for or stopping the command also calls."""
 
     def __init__(
         self,
@@ -828,6 +832,10 @@ class RunningCmd:
         self.sudo = sudo
         self.stopped = False
         self.ssh_log: Path | None = None
+        self._result: subprocess.CompletedProcess[str] | None = None
+        self._error: SubprocessError | None = None
+        self._monitor: threading.Thread | None = None
+        self._monitor_stop = threading.Event()
         env: Mapping[str, str] | None = kwargs.pop("env", None)
         base_env = os.environ if env is None else env
         rsh = base_env.get("BORG_RSH")
@@ -880,6 +888,26 @@ class RunningCmd:
     def poll(self) -> int | None:
         return self.proc.poll()
 
+    def start_monitor(self, monitor: Callable[[threading.Event], None]) -> None:
+        """Run `monitor` in a daemon thread alongside the command, passing
+        it an event that is set when it is to stop; it should return
+        promptly once it is. A command has at most one monitor."""
+        assert self._monitor is None, f"{self.cmd_str} already has a monitor"
+        self._monitor = threading.Thread(
+            target=monitor, args=(self._monitor_stop,), daemon=True
+        )
+        self._monitor.start()
+
+    def stop_monitor(self) -> None:
+        """Stop the monitor, if there is one, waiting up to `CMD_TIMEOUT`
+        for it to return; one stuck in a call it cannot leave, such as a
+        read the command is not answering, is left behind once that wait
+        runs out, which as a daemon thread it may be. Stopping the command,
+        or waiting for it to finish, does this too."""
+        self._monitor_stop.set()
+        if self._monitor is not None:
+            self._monitor.join(_cmd_timeout(slow=False))
+
     def _signal(self, sig: signal.Signals) -> None:
         """Send `sig` to the process. sudo relays a signal it receives --
         all but SIGKILL -- to the command it runs. Whether the invoking
@@ -900,6 +928,7 @@ class RunningCmd:
         sudo'd command, but not necessarily the command it runs. Raises
         BorgadmError if the process outlives both signals."""
         self.stopped = True
+        self.stop_monitor()
         grace = _cmd_timeout(slow=False)
         for sig in (signal.SIGTERM, signal.SIGKILL):
             self._signal(sig)
@@ -941,13 +970,20 @@ class RunningCmd:
         means it completed with warnings, which are logged as such. Any
         other non-zero exit is a failure: logged unless `log_error` is
         False, and raised as SubprocessError unless `errok` -- except one
-        whose stderr satisfies `quiet_if`, which is just returned."""
+        whose stderr satisfies `quiet_if`, which is just returned. The
+        first call handles the outcome; a later one returns the same
+        result, or raises the same failure again unless `errok`."""
+        if self._result is not None:
+            if self._error is not None and not errok:
+                raise self._error
+            return self._result
         timed_out = ""
         try:
             self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
             timed_out = f" (timed out after {timeout}s)"
             self.stop()
+        self.stop_monitor()
         # A stopped sudo process may leave its command running and
         # holding the output pipes open, so the pumps get a bounded wait.
         for pump in self._pumps:
@@ -963,6 +999,7 @@ class RunningCmd:
         if stderr:
             logger.debug(f"stderr:\n{stderr.strip()}")
         result = subprocess.CompletedProcess(self.cmd, rc, stdout, stderr)
+        self._result = result
 
         if self.borg and rc == ExitCode.WARNING:
             # Borg exit code 1 means the operation completed with
@@ -987,10 +1024,11 @@ class RunningCmd:
                     stderr.strip(),
                     self._ssh_log_tail(),
                 )
+            self._error = SubprocessError(
+                rc, self.cmd, output=stdout, stderr=stderr
+            )
             if not errok:
-                raise SubprocessError(
-                    rc, self.cmd, output=stdout, stderr=stderr
-                )
+                raise self._error
         return result
 
 
@@ -1606,8 +1644,59 @@ def _reclaim_stale_run_dirs(parent: Path, prefix: str, keep: Path) -> None:
 
 
 # How often a starting foreground mount is checked for its mountpoint
-# appearing (or its borg process exiting first).
+# appearing (or its borg process exiting first), and a running rsync's
+# mounts for one whose borg process has exited.
 _MOUNT_POLL_SEC = 1.0
+
+# The largest file a mount's probe reads, and how often it reads it.
+_PROBE_MAX_BYTES = 64 * 1024
+_PROBE_INTERVAL_SEC = 60.0
+
+
+def _pick_probe_file(mount_dir: Path) -> Path | None:
+    """A small, non-empty regular file under `mount_dir` that borgadm can
+    read, for the mount's probe; None if there is none."""
+    for dirpath, _dirs, files in os.walk(mount_dir):
+        for name in files:
+            path = Path(dirpath) / name
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            if (
+                stat.S_ISREG(st.st_mode)
+                and 0 < st.st_size <= _PROBE_MAX_BYTES
+                and os.access(path, os.R_OK)
+            ):
+                return path
+    return None
+
+
+def _read_probe(path: Path) -> None:
+    """Read `path` from its borg mount, so that borg fetches its data from
+    the repository -- which fails, and ends the mount, when the mount's
+    connection to the repository is gone. Two caches could answer the
+    read without the repository, and both are avoided: a borg mount lets
+    the kernel keep a file's data cached between opens, so the file is
+    evicted from the page cache first, and borg keeps a chunk read only
+    in part in a cache of its own, so the file is read in full. Mounts
+    serve only rsync, which runs only on Linux."""
+    with open(path, "rb") as f:
+        if sys.platform == "linux":
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        f.read()
+
+
+def _probe_mount(probe: Path, stop: threading.Event) -> None:
+    """A mount's monitor: re-read `probe` every `_PROBE_INTERVAL_SEC`
+    until `stop` is set. A read that fails has ended the mount, and that
+    is how the loss is noticed, so the loop just ends."""
+    while not stop.wait(_PROBE_INTERVAL_SEC):
+        try:
+            _read_probe(probe)
+        except OSError as e:
+            logger.debug(f"Probe read of {probe} failed: {e}")
+            return
 
 
 def _start_foreground_mount(
@@ -1621,6 +1710,15 @@ def _start_foreground_mount(
     """Mount `archive_ref` on `mount_dir` with a `borg mount -f` kept
     running, returning it once the mount is up. borg logs at debug level,
     so a failure reported for it shows what borg was doing.
+
+    The mount gets a probe monitor: it reads a small file from the mount
+    once when the mount comes up and then every `_PROBE_INTERVAL_SEC`,
+    each read reaching the repository, so a mount whose repository
+    connection is lost ends -- and its borg process exits -- at the next
+    probe once ssh has given up on the connection, rather than whenever
+    something next needs data from it. A mount holding no small file
+    borgadm can read has nothing to probe and runs without a monitor; one
+    whose first probe read fails is torn down and raises.
 
     Locking follows `run_borg`: a `LOCK_CHECK_TIMEOUT` lock-wait first,
     then -- only if that attempt exits on borg's LockTimeout -- a retry
@@ -1663,6 +1761,24 @@ def _start_foreground_mount(
             time.sleep(_MOUNT_POLL_SEC)
         return mount
 
+    def probed(mount: RunningCmd) -> RunningCmd:
+        """Give the up `mount` its probe monitor, after a first read."""
+        probe = _pick_probe_file(mount_dir)
+        if probe is None:
+            logger.debug(f"No file to probe the mount of {archive_name}")
+            return mount
+        logger.debug(f"Probing the mount of {archive_name} with {probe}")
+        try:
+            _read_probe(probe)
+        except OSError as e:
+            _umount_tree(mount_dir)
+            mount.wait(cfg.CMD_TIMEOUT, errok=True)
+            raise BorgadmError(
+                f"Cannot probe the mount of {archive_name}: {e}"
+            ) from e
+        mount.start_monitor(functools.partial(_probe_mount, probe))
+        return mount
+
     if bypass_lock:
         flags = ["--bypass-lock"]
         mount = launch(flags, _bypass_lock_env(os.environ, scratch))
@@ -1670,7 +1786,7 @@ def _start_foreground_mount(
         flags = ["--lock-wait", str(cfg.LOCK_CHECK_TIMEOUT)]
         mount = launch(flags)
     if mount.poll() is None:
-        return mount
+        return probed(mount)
     # Exited without mounting: a failure raises, except the LockTimeout
     # of a first lock-wait, which is retried with the long wait.
     first = mount.wait(quiet_if=None if bypass_lock else _is_lock_timeout)
@@ -1678,7 +1794,7 @@ def _start_foreground_mount(
         _announce_lock_wait()
         mount = launch(["--lock-wait", str(cfg.BORG_CMD_TIMEOUT)])
         if mount.poll() is None:
-            return mount
+            return probed(mount)
         mount.wait()
     raise BorgadmError(f"borg mount of {archive_name} exited without mounting")
 
@@ -1686,9 +1802,9 @@ def _start_foreground_mount(
 def _reap_mounts(mounts: list[RunningCmd], *, report: bool) -> None:
     """Reap each mount's `borg mount -f` once its filesystem is unmounted,
     stopping one still running `CMD_TIMEOUT` seconds later. With
-    `report`, each mount that failed is logged, one after another. Runs
-    during cleanup, so a mount that cannot be stopped is reported rather
-    than raised over the run's own error."""
+    `report`, each mount that failed is logged, one after another, unless
+    it already was. Runs during cleanup, so a mount that cannot be
+    stopped is reported rather than raised over the run's own error."""
     for mount in mounts:
         try:
             mount.wait(get_cfg().CMD_TIMEOUT, errok=True, log_error=report)
@@ -3032,6 +3148,37 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
     do_compact(progress)
 
 
+def _wait_for_rsync(
+    rsync: RunningCmd, mounts: list[tuple[Path, RunningCmd]]
+) -> None:
+    """Wait, within its timeout, for `rsync` to finish reading from
+    `mounts` (mountpoint, borg process). A mount whose borg process exits
+    has stopped serving its archive, leaving everything rsync has yet to
+    read from it unreadable, so rsync is stopped there and then, the
+    mount's failure is logged, and BorgadmError raised. A failed rsync
+    raises as any command does."""
+    deadline = time.monotonic() + rsync.timeout
+    while rsync.poll() is None:
+        for mount_dir, mount in mounts:
+            if (rc := mount.poll()) is not None:
+                logger.error(
+                    f"borg mount of {mount_dir.name} exited (exit code "
+                    f"{rc}) while rsync was running; stopping rsync"
+                )
+                mount.wait(errok=True)
+                rsync.stop()
+                rsync.wait(errok=True, log_error=False)
+                raise BorgadmError(f"Lost the mount of {mount_dir.name}")
+        if time.monotonic() >= deadline:
+            logger.error(
+                f"rsync did not finish within {rsync.timeout}s; stopping it"
+            )
+            rsync.stop()
+            break
+        time.sleep(_MOUNT_POLL_SEC)
+    rsync.wait()
+
+
 def do_rsync(
     target_dir: Path,
     dry_run: bool,
@@ -3080,9 +3227,9 @@ def do_rsync(
         )
         tmpdir = Path(tmpdir_ctx.name)
         bypass_root = tmpdir / "bypass"
-        mounts: list[RunningCmd] = []
-        mount_dirs: list[Path] = []
-        rsync_failed = False
+        mounts: list[tuple[Path, RunningCmd]] = []
+        rsync: RunningCmd | None = None
+        interrupted = False
         try:
             # Reclaim tmp dirs orphaned by a previously SIGKILLed run of
             # this same target.
@@ -3094,21 +3241,19 @@ def do_rsync(
 
                 os.makedirs(mount_dir)
                 logger.info(f"Mounting {archive_ref} to: {mount_dir}")
-                mounts.append(
-                    _start_foreground_mount(
-                        archive_ref,
-                        mount_dir,
-                        bypass_lock=bypass_lock,
-                        scratch=bypass_root / archive_name,
-                        sudo=True,
-                    )
+                mount = _start_foreground_mount(
+                    archive_ref,
+                    mount_dir,
+                    bypass_lock=bypass_lock,
+                    scratch=bypass_root / archive_name,
+                    sudo=True,
                 )
-                mount_dirs.append(mount_dir)
+                mounts.append((mount_dir, mount))
 
                 if not os.listdir(mount_dir):
                     raise BorgadmError(f"Empty archive mount: {archive_ref}")
 
-            lowerdir = ":".join(d.as_posix() for d in mount_dirs)
+            lowerdir = ":".join(d.as_posix() for d, _ in mounts)
             upperdir = tmpdir / "upperdir"
             workdir = tmpdir / "workdir"
             merged = tmpdir / "merged"
@@ -3140,11 +3285,8 @@ def do_rsync(
             cmd += ["--delete"] if delete else []
             cmd += ["--dry-run"] if dry_run else []
             cmd += [merged.as_posix() + "/", target_dir.as_posix() + "/"]
-            try:
-                run_cmd(cmd, allow_output=progress, sudo=True)
-            except SubprocessError:
-                rsync_failed = True
-                raise
+            rsync = RunningCmd(cmd, sudo=True, allow_output=progress)
+            _wait_for_rsync(rsync, mounts)
 
             # Record the version we extraced
             (tdir_dirname / f".{BASENAME}_{tdir_basename}.ts").write_text(
@@ -3152,18 +3294,31 @@ def do_rsync(
             )
 
             logger.info(f"Finished rsync to: {target_dir}")
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         finally:
-            # Cleanup root owned resources. The mount table, not
-            # bookkeeping, decides what comes down, so a mount stranded by
-            # a failure between mounting and any later step is still torn
-            # down before the TemporaryDirectory cleanup walks the tree.
-            # Unmounting ends each borg mount; a mount that failed is what
-            # explains a failed rsync, so it is reported only then. The
-            # overlay workdir and the bypass-lock cache dirs are
-            # root-owned and must be removed with sudo before that cleanup
-            # can clear the rest.
+            # Cleanup root owned resources. Each mount's monitor stops
+            # before anything is unmounted, so none is reading from a
+            # mount as it comes down, and an rsync still running (as after
+            # an interrupt) is stopped before its source goes. The mount
+            # table, not bookkeeping, decides what comes down, so a mount
+            # stranded by a failure between mounting and any later step is
+            # still torn down before the TemporaryDirectory cleanup walks
+            # the tree. Unmounting ends each borg mount; one that failed is
+            # reported, unless the run was interrupted -- the terminal's
+            # SIGINT reaches the mounts too. The overlay workdir and the
+            # bypass-lock cache dirs are root-owned and must be removed
+            # with sudo before that cleanup can clear the rest.
+            for _, mount in mounts:
+                mount.stop_monitor()
+            if rsync is not None and rsync.poll() is None:
+                try:
+                    rsync.stop()
+                except BorgadmError as e:
+                    logger.warning(str(e))
             _umount_tree(tmpdir)
-            _reap_mounts(mounts, report=rsync_failed)
+            _reap_mounts([m for _, m in mounts], report=not interrupted)
             run_cmd(
                 [
                     "rm",

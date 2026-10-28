@@ -7,13 +7,15 @@ control-dir layout and record type.
 
 It is driven through files in the control dir next to the mountpoint (the
 last argument; see `control_dir`): `mode` picks the behavior, the stand-in
-touches `mounted` once it "serves", and the test touches `die`, `kill` or
-`unmount` to end it. Every invocation appends an `Attempt` to
-`attempts.jsonl`, and -- standing in for the ssh borg would start -- writes
-`SSH_LOG_LINES` to the file named by `-E` in BORG_RSH, if there is one.
+"serves" by writing `SERVED_FILE` into the mountpoint and touching `mounted`,
+and the test touches `die`, `kill` or `unmount` to end it. Every invocation
+appends an `Attempt` to `attempts.jsonl`, and -- standing in for the ssh borg
+would start -- writes `SSH_LOG_LINES` to the file named by `-E` in BORG_RSH,
+if there is one.
 
 Modes:
 
+- `bare`: serve, but write no file into the mountpoint.
 - `fail`: write an error and exit 2 without mounting.
 - `hang`: neither mount nor exit (for a minute).
 - `lock`: exit on borg's LockTimeout when given the short lock-wait recorded
@@ -37,6 +39,7 @@ from pathlib import Path
 from typing import TypedDict
 
 SSH_LOG_LINES = [f"ssh {i:02}" for i in range(1, 13)]
+SERVED_FILE = "served.txt"
 
 
 class Attempt(TypedDict):
@@ -77,8 +80,10 @@ def _write_ssh_log() -> None:
             f.writelines(f"{line}\n" for line in SSH_LOG_LINES)
 
 
-def _serve(ctl: Path) -> int:
+def _serve(ctl: Path, mount_dir: Path, *, with_file: bool = True) -> int:
     _say("starting")
+    if with_file:
+        (mount_dir / SERVED_FILE).write_text("archive data\n", encoding="utf-8")
     (ctl / "mounted").touch()
     while not (ctl / "unmount").exists():
         if (ctl / "die").exists():
@@ -92,7 +97,8 @@ def _serve(ctl: Path) -> int:
 
 
 def main(args: list[str]) -> int:
-    ctl = control_dir(Path(args[-1]))
+    mount_dir = Path(args[-1])
+    ctl = control_dir(mount_dir)
     mode = (ctl / "mode").read_text(encoding="utf-8")
     _record(ctl, args)
     if args[0] == "linger":
@@ -102,7 +108,9 @@ def main(args: list[str]) -> int:
     if mode == "orphan":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         subprocess.Popen([sys.executable, __file__, "linger", args[-1]])
-        return _serve(ctl)
+        return _serve(ctl, mount_dir)
+    if mode == "bare":
+        return _serve(ctl, mount_dir, with_file=False)
     if mode == "fail":
         _say("repository error: boom")
         return 2
@@ -118,7 +126,7 @@ def main(args: list[str]) -> int:
             return 2
     if mode == "stubborn":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    return _serve(ctl)
+    return _serve(ctl, mount_dir)
 
 
 if __name__ == "__main__":

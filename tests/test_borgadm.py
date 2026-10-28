@@ -18,6 +18,7 @@ Unit tests for borgadm
 import argparse
 import collections
 import contextlib
+import errno
 import io
 import json
 import logging
@@ -30,14 +31,15 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, cast
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, call, create_autospec, patch
 
 import pytest
 from conftest import (
@@ -2711,12 +2713,31 @@ class TestInitializeBorgEnvironmentSshGating:
         assert "-o ServerAliveCountMax=30" in rsh
 
 
+# The class itself, for specs of fakes built while tests have
+# `ba.RunningCmd` patched.
+_RUNNING_CMD = ba.RunningCmd
+
+
 def _fake_foreground_mount(
     _archive_ref: str, _mount_dir: Path, **_kwargs: Any
 ) -> Any:
     """Stand-in for `_start_foreground_mount` in tests that drive
-    `do_rsync` with the borg processes mocked out."""
-    return Mock(spec=ba.RunningCmd)
+    `do_rsync` with the borg processes mocked out: a mount whose borg
+    process is still running."""
+    mount = create_autospec(_RUNNING_CMD, instance=True)
+    mount.poll.return_value = None
+    return mount
+
+
+def _fake_rsync(outcome: BaseException | None = None) -> Any:
+    """Stand-in for the rsync `RunningCmd` in tests that drive `do_rsync`:
+    one that has already finished, whose `wait()` raises `outcome` if
+    given."""
+    rsync = create_autospec(_RUNNING_CMD, instance=True)
+    rsync.timeout = 3600
+    rsync.poll.return_value = 0
+    rsync.wait.side_effect = outcome
+    return rsync
 
 
 _REAL_ISMOUNT = os.path.ismount
@@ -3079,10 +3100,206 @@ class TestRunningCmd:
             "mount": mock_cfg.CMD_TIMEOUT,
         }
 
+    def test_wait_reports_an_outcome_once(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        run = ba.RunningCmd(standin.command("list"))
+        first = run.wait(errok=True)
+        assert run.wait(errok=True) is first
+        with pytest.raises(berr.SubprocessError) as excinfo:
+            run.wait()
+        assert excinfo.value.returncode == first.returncode
+        assert len(_errors(caplog)) == 1
+
+
+class TestRunningCmdMonitor:
+    """A command's monitor thread: started on request, stopped by
+    `stop_monitor()` or by waiting for or stopping the command."""
+
+    @staticmethod
+    def _monitor(
+        started: threading.Event, seen: list[int | None], run: ba.RunningCmd
+    ) -> Callable[[threading.Event], None]:
+        """A monitor that signals `started`, waits to be stopped, then
+        records `run`'s exit status (None while it still runs)."""
+
+        def monitor(stop: threading.Event) -> None:
+            started.set()
+            stop.wait()
+            seen.append(run.poll())
+
+        return monitor
+
+    def test_stop_monitor_ends_it(self, standin: _StandinBorg) -> None:
+        standin.set_mode("serve")
+        run = ba.RunningCmd(standin.command("mount"))
+        started = threading.Event()
+        seen: list[int | None] = []
+        run.start_monitor(self._monitor(started, seen, run))
+        assert started.wait(10)
+        run.stop_monitor()
+        assert seen == [None]
+        run.stop_monitor()
+        standin.touch("unmount")
+        assert run.wait(10).returncode == 0
+        assert seen == [None]
+
+    def test_stop_monitor_gives_up_on_a_monitor_that_will_not_stop(
+        self, standin: _StandinBorg, mock_cfg: Any
+    ) -> None:
+        """A monitor stuck in a call it cannot leave is waited for only up
+        to `CMD_TIMEOUT`, then left behind."""
+        standin.set_mode("serve")
+        run = ba.RunningCmd(standin.command("mount"))
+        started = threading.Event()
+        release = threading.Event()
+
+        def stuck(_stop: threading.Event) -> None:
+            started.set()
+            release.wait(30)
+
+        run.start_monitor(stuck)
+        assert started.wait(10)
+        try:
+            with patch.object(mock_cfg, "CMD_TIMEOUT", 1):
+                begun = time.monotonic()
+                run.stop_monitor()
+                assert time.monotonic() - begun < 10
+        finally:
+            release.set()
+            standin.touch("unmount")
+            run.wait(10)
+
+    def test_waiting_for_the_command_ends_it(
+        self, standin: _StandinBorg
+    ) -> None:
+        standin.set_mode("serve")
+        run = ba.RunningCmd(standin.command("mount"))
+        started = threading.Event()
+        seen: list[int | None] = []
+        run.start_monitor(self._monitor(started, seen, run))
+        assert started.wait(10)
+        standin.touch("unmount")
+        run.wait(10)
+        assert seen == [0]
+
+    def test_stopping_the_command_ends_it_first(
+        self, standin: _StandinBorg
+    ) -> None:
+        """The monitor is stopped before the process is signalled, so it
+        never runs against a command being torn down."""
+        standin.set_mode("serve")
+        run = ba.RunningCmd(standin.command("mount"))
+        started = threading.Event()
+        seen: list[int | None] = []
+        run.start_monitor(self._monitor(started, seen, run))
+        assert started.wait(10)
+        run.stop()
+        assert seen == [None]
+        assert run.poll() == -signal.SIGTERM
+
+    def test_a_command_has_one_monitor(self, standin: _StandinBorg) -> None:
+        standin.set_mode("serve")
+        run = ba.RunningCmd(standin.command("mount"))
+        started = threading.Event()
+        seen: list[int | None] = []
+        run.start_monitor(self._monitor(started, seen, run))
+        with pytest.raises(AssertionError, match="already has a monitor"):
+            run.start_monitor(self._monitor(threading.Event(), seen, run))
+        standin.touch("unmount")
+        run.wait(10)
+
+
+class TestMountProbe:
+    """Picking a mount's probe file and reading it."""
+
+    def test_picks_a_small_readable_regular_file(self, tmp_path: Path) -> None:
+        (tmp_path / "empty").touch()
+        (tmp_path / "big").write_bytes(b"x" * (ba._PROBE_MAX_BYTES + 1))
+        (tmp_path / "sub").mkdir()
+        good = tmp_path / "sub" / "good"
+        good.write_bytes(b"data")
+        (tmp_path / "link").symlink_to(good)
+        unreadable = tmp_path / "unreadable"
+        unreadable.write_bytes(b"data")
+        unreadable.chmod(0)
+        try:
+            assert ba._pick_probe_file(tmp_path) == good
+        finally:
+            unreadable.chmod(0o600)
+
+    def test_no_probe_file(self, tmp_path: Path) -> None:
+        (tmp_path / "empty").touch()
+        assert ba._pick_probe_file(tmp_path) is None
+
+    def test_read_raises_when_the_file_cannot_be_read(
+        self, tmp_path: Path
+    ) -> None:
+        probe = tmp_path / "probe"
+        probe.write_bytes(b"data")
+        ba._read_probe(probe)
+        probe.unlink()
+        with pytest.raises(FileNotFoundError):
+            ba._read_probe(probe)
+
+    @pytest.mark.skipif(
+        sys.platform != "linux", reason="page-cache eviction is Linux-only"
+    )
+    def test_read_evicts_the_file_from_the_page_cache(
+        self, tmp_path: Path
+    ) -> None:
+        probe = tmp_path / "probe"
+        probe.write_bytes(b"data")
+        with patch.object(ba.os, "posix_fadvise", autospec=True) as fadvise:
+            ba._read_probe(probe)
+        fadvise.assert_called_once()
+        # The `if` narrows the platform for mypy, which knows no
+        # POSIX_FADV_DONTNEED when checking on macOS.
+        if sys.platform == "linux":
+            advice = os.POSIX_FADV_DONTNEED
+            assert fadvise.call_args.args[1:] == (0, 0, advice)
+
+    def test_monitor_rereads_until_stopped(self, tmp_path: Path) -> None:
+        probe = tmp_path / "probe"
+        reads = threading.Semaphore(0)
+        stop = threading.Event()
+        with (
+            patch.object(ba, "_PROBE_INTERVAL_SEC", 0.01),
+            patch.object(
+                ba,
+                "_read_probe",
+                autospec=True,
+                side_effect=lambda _p: reads.release(),
+            ) as read,
+        ):
+            thread = threading.Thread(
+                target=ba._probe_mount, args=(probe, stop), daemon=True
+            )
+            thread.start()
+            for _ in range(3):
+                assert reads.acquire(timeout=10)
+            stop.set()
+            thread.join(10)
+        assert not thread.is_alive()
+        assert all(c.args == (probe,) for c in read.call_args_list)
+
+    def test_monitor_ends_when_a_read_fails(self, tmp_path: Path) -> None:
+        """A failed read has ended the mount; the monitor just returns."""
+        err = OSError(errno.ECONNABORTED, "Software caused connection abort")
+        with (
+            patch.object(ba, "_PROBE_INTERVAL_SEC", 0.01),
+            patch.object(
+                ba, "_read_probe", autospec=True, side_effect=err
+            ) as read,
+        ):
+            ba._probe_mount(tmp_path / "probe", threading.Event())
+        read.assert_called_once()
+
 
 class TestForegroundMount:
-    """Starting a `borg mount -f`: debug logging, lock retry, and startup
-    failures -- against real processes."""
+    """Starting a `borg mount -f`: debug logging, lock retry, its probe,
+    and startup failures -- against real processes."""
 
     def test_mounts_at_debug_level_and_returns_once_up(
         self, standin: _StandinBorg, tmp_path: Path, mock_cfg: Any
@@ -3101,12 +3318,17 @@ class TestForegroundMount:
         assert mount.wait(10).returncode == 0
 
     def test_start_passes_sudo_to_the_mount(self, mock_cfg: Any) -> None:
+        probe = Path("/t/home-1of2/file")
         with (
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "RunningCmd", autospec=True) as running,
             patch.object(
                 ba.os.path, "ismount", autospec=True, return_value=True
             ),
+            patch.object(
+                ba, "_pick_probe_file", autospec=True, return_value=probe
+            ),
+            patch.object(ba, "_read_probe", autospec=True) as read,
         ):
             running.return_value.poll.return_value = None
             mount = ba._start_foreground_mount(
@@ -3117,6 +3339,10 @@ class TestForegroundMount:
                 sudo=True,
             )
         assert mount is running.return_value
+        read.assert_called_once_with(probe)
+        monitor = mount.start_monitor.call_args.args[0]
+        assert monitor.func is ba._probe_mount
+        assert monitor.args == (probe,)
         running.assert_called_once_with(
             [
                 "borg",
@@ -3133,6 +3359,77 @@ class TestForegroundMount:
             sudo=True,
             env=None,
         )
+
+    def test_probe_is_read_once_up_then_monitored(
+        self, standin: _StandinBorg, tmp_path: Path
+    ) -> None:
+        """The probe file is read before the mount is handed back, then
+        re-read by the mount's monitor until the mount ends."""
+        real_read = ba._read_probe
+        caller = threading.get_ident()
+        reads: list[tuple[Path, int]] = []
+        read_done = threading.Semaphore(0)
+
+        def read(path: Path) -> None:
+            real_read(path)
+            reads.append((path, threading.get_ident()))
+            read_done.release()
+
+        standin.set_mode("serve")
+        with (
+            patch.object(ba, "_PROBE_INTERVAL_SEC", 0.01),
+            patch.object(ba, "_read_probe", autospec=True, side_effect=read),
+        ):
+            mount = standin.start(tmp_path / "scratch")
+            served = standin.mount_dir / borgadm_mount_standin.SERVED_FILE
+            assert reads[0] == (served, caller)
+            for _ in range(3):
+                assert read_done.acquire(timeout=10)
+            standin.touch("unmount")
+            assert mount.wait(10).returncode == 0
+            after_end = len(reads)
+            time.sleep(0.1)
+        assert len(reads) == after_end
+        assert {path for path, _ in reads} == {served}
+        assert any(thread != caller for _, thread in reads[1:])
+
+    def test_mount_with_nothing_to_probe_runs_unwatched(
+        self, standin: _StandinBorg, tmp_path: Path
+    ) -> None:
+        standin.set_mode("bare")
+        with patch.object(
+            ba.RunningCmd, "start_monitor", autospec=True
+        ) as start_monitor:
+            mount = standin.start(tmp_path / "scratch")
+        assert mount.poll() is None
+        start_monitor.assert_not_called()
+        standin.touch("unmount")
+        assert mount.wait(10).returncode == 0
+
+    def test_failed_first_probe_tears_the_mount_down_and_raises(
+        self, standin: _StandinBorg, tmp_path: Path
+    ) -> None:
+        """A mount that cannot serve its probe file is unmounted -- which
+        ends its borg process -- before the start raises."""
+        standin.set_mode("serve")
+        err = OSError(errno.ECONNABORTED, "Software caused connection abort")
+        with (
+            patch.object(ba, "_read_probe", autospec=True, side_effect=err),
+            patch.object(
+                ba,
+                "_umount_tree",
+                autospec=True,
+                side_effect=lambda _root: standin.touch("unmount"),
+            ) as umount,
+            pytest.raises(
+                berr.BorgadmError,
+                match="Cannot probe the mount of home-1of2: .*connection abort",
+            ),
+        ):
+            standin.start(tmp_path / "scratch")
+        umount.assert_called_once_with(standin.mount_dir)
+        with pytest.raises(ProcessLookupError):
+            os.kill(standin.attempts()[0]["pid"], 0)
 
     def test_lock_timeout_retries_with_long_wait_quietly(
         self,
@@ -3271,6 +3568,15 @@ class TestReapMounts:
         ba._reap_mounts([mount], report=False)
         assert mount.poll() == 2
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_mount_already_reported_is_not_reported_again(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        mount = ba.RunningCmd(standin.command("mount"))
+        mount.wait(errok=True)
+        ba._reap_mounts([mount], report=True)
+        assert len(_errors(caplog)) == 1
 
     def test_stops_a_mount_that_outlives_the_wait(
         self, standin: _StandinBorg, mock_cfg: Any, caplog: Any
@@ -3479,6 +3785,9 @@ class TestRsyncMountCleanup:
                 ba, "_mounts_under", autospec=True, side_effect=fake_mounts
             ),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(
+                ba, "RunningCmd", autospec=True, return_value=_fake_rsync()
+            ) as running,
         ):
             ba.do_rsync(
                 target,
@@ -3500,7 +3809,8 @@ class TestRsyncMountCleanup:
             if c.args[0][:2] == ["rm", "-rf"]
         ]
         assert rms == [["workdir", "bypass"]]
-        assert any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
+        assert running.call_args.args[0][0] == "rsync"
+        assert running.call_args.kwargs == {"sudo": True, "allow_output": False}
 
     def test_do_rsync_archive_records_selected_timestamp(
         self, mock_cfg: Any, tmp_path: Path
@@ -3531,6 +3841,9 @@ class TestRsyncMountCleanup:
             patch.object(ba, "_reap_mounts", autospec=True),
             patch.object(ba, "_mounts_under", autospec=True, return_value=[]),
             patch.object(ba, "run_cmd", autospec=True),
+            patch.object(
+                ba, "RunningCmd", autospec=True, return_value=_fake_rsync()
+            ),
         ):
             ba.do_rsync(
                 target,
@@ -3579,6 +3892,7 @@ class TestRsyncMountCleanup:
                 ba, "_mounts_under", autospec=True, side_effect=fake_mounts
             ),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "RunningCmd", autospec=True) as running,
             pytest.raises(berr.SubprocessError),
         ):
             ba.do_rsync(
@@ -3595,46 +3909,52 @@ class TestRsyncMountCleanup:
             if c.args[0][0] == "umount"
         ]
         assert umounts == ["home-fuse-1of2"]
-        assert not any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
+        running.assert_not_called()
 
     @pytest.mark.parametrize(
-        ("rsync_raises", "report"),
+        ("outcome", "report", "rsync_running"),
         [
-            (None, False),
+            (None, True, False),
             (
                 berr.SubprocessError(23, ["rsync"], output="", stderr="boom"),
                 True,
+                False,
             ),
-            (KeyboardInterrupt(), False),
+            (berr.BorgadmError("Lost the mount of x"), True, False),
+            (KeyboardInterrupt(), False, True),
         ],
-        ids=["rsync-ok", "rsync-fails", "interrupted"],
+        ids=["rsync-ok", "rsync-fails", "mount-lost", "interrupted"],
     )
-    def test_do_rsync_unmounts_then_reaps_reporting_on_rsync_failure(
+    def test_do_rsync_stops_monitors_unmounts_then_reaps(
         self,
         tmp_path: Path,
-        rsync_raises: BaseException | None,
+        outcome: BaseException | None,
         report: bool,
+        rsync_running: bool,
     ) -> None:
         """Each archive is mounted as root with its own bypass scratch
-        dir, and the overlay stacks the mounts in archive order. Cleanup
-        -- whether or not rsync succeeded -- unmounts, then reaps the
-        mounts, reporting those that failed only when rsync did."""
+        dir, and the overlay stacks the mounts in archive order. However
+        the run ends, cleanup stops every mount's monitor, stops an rsync
+        still running, unmounts, then reaps the mounts -- reporting those
+        that failed unless the run was interrupted."""
         target = tmp_path / "borg-rsync"
         target.mkdir()
         archives = ["repo::home-fuse-1of2", "repo::home-local-2of2"]
         order: list[str] = []
         created: list[Any] = []
         ran: list[list[str]] = []
+        rsync = _fake_rsync()
+        rsync.poll.return_value = None if rsync_running else 0
+        rsync.stop.side_effect = lambda: order.append("stop rsync")
 
         def fake_mount(archive_ref: str, mount_dir: Path, **kwargs: Any) -> Any:
             mount = _fake_foreground_mount(archive_ref, mount_dir, **kwargs)
+            mount.stop_monitor.side_effect = lambda: order.append("monitor")
             created.append(mount)
             return mount
 
         def fake_run(cmd: list[str], **_kwargs: Any) -> None:
             ran.append(cmd)
-            if cmd[0] == "rsync" and rsync_raises is not None:
-                raise rsync_raises
 
         with (
             patch.object(ba.platform, "system", return_value="Linux"),
@@ -3665,8 +3985,12 @@ class TestRsyncMountCleanup:
                 side_effect=lambda _m, **_kw: order.append("reap"),
             ) as mock_reap,
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
-            pytest.raises(type(rsync_raises))
-            if rsync_raises is not None
+            patch.object(ba, "RunningCmd", autospec=True, return_value=rsync),
+            patch.object(
+                ba, "_wait_for_rsync", autospec=True, side_effect=outcome
+            ) as wait_for_rsync,
+            pytest.raises(type(outcome))
+            if outcome is not None
             else contextlib.nullcontext(),
         ):
             ba.do_rsync(
@@ -3677,7 +4001,11 @@ class TestRsyncMountCleanup:
                 bypass_lock=False,
                 archive=None,
             )
-        assert order == ["umount", "reap"]
+        stop_rsync = ["stop rsync"] if rsync_running else []
+        assert order == ["monitor", "monitor", *stop_rsync, "umount", "reap"]
+        mounts = wait_for_rsync.call_args.args[1]
+        assert [mount for _, mount in mounts] == created
+        assert wait_for_rsync.call_args.args[0] is rsync
         assert mock_reap.call_args.args[0] == created
         assert mock_reap.call_args.kwargs == {"report": report}
         mount_dirs = [c.args[1] for c in mock_mount.call_args_list]
@@ -3694,6 +4022,104 @@ class TestRsyncMountCleanup:
                 "scratch": mount_dir.parent / "bypass" / mount_dir.name,
                 "sudo": True,
             }
+
+
+class TestWaitForRsync:
+    """Waiting for rsync while watching the mounts it reads from."""
+
+    @staticmethod
+    def _mounts(*exit_codes: int | None) -> list[tuple[Path, Any]]:
+        mounts = []
+        for i, rc in enumerate(exit_codes):
+            mount_dir = Path(f"/t/home-{i}")
+            mount = _fake_foreground_mount("", mount_dir)
+            mount.poll.return_value = rc
+            mounts.append((mount_dir, mount))
+        return mounts
+
+    def test_returns_once_rsync_finishes(self) -> None:
+        rsync = _fake_rsync()
+        ba._wait_for_rsync(rsync, self._mounts(None, None))
+        rsync.wait.assert_called_once_with()
+        rsync.stop.assert_not_called()
+
+    def test_a_mount_exiting_stops_rsync_and_raises(self, caplog: Any) -> None:
+        """The lost mount is reported first, then rsync is stopped -- its
+        own exit status says nothing a reader needs."""
+        order: list[str] = []
+        rsync = _fake_rsync()
+        rsync.poll.return_value = None
+        rsync.stop.side_effect = lambda: order.append("stop rsync")
+        rsync.wait.side_effect = lambda **_kw: order.append("reap rsync")
+        mounts = self._mounts(None, 2)
+        lost = mounts[1][1]
+        lost.wait.side_effect = lambda **_kw: order.append("report mount")
+        with (
+            patch.object(ba, "_MOUNT_POLL_SEC", 0),
+            pytest.raises(berr.BorgadmError, match="Lost the mount of home-1"),
+        ):
+            ba._wait_for_rsync(rsync, mounts)
+        assert order == ["report mount", "stop rsync", "reap rsync"]
+        lost.wait.assert_called_once_with(errok=True)
+        rsync.wait.assert_called_once_with(errok=True, log_error=False)
+        mounts[0][1].wait.assert_not_called()
+        assert _errors(caplog) == [
+            (
+                "borg mount of home-1 exited (exit code 2) while rsync was "
+                "running; stopping rsync"
+            )
+        ]
+
+    def test_rsync_past_its_timeout_is_stopped(self, caplog: Any) -> None:
+        stopped = berr.SubprocessError(-15, ["rsync"], output="", stderr="")
+        rsync = _fake_rsync(stopped)
+        rsync.poll.return_value = None
+        rsync.timeout = 0
+        with (
+            patch.object(ba, "_MOUNT_POLL_SEC", 0),
+            pytest.raises(berr.SubprocessError),
+        ):
+            ba._wait_for_rsync(rsync, self._mounts(None))
+        rsync.stop.assert_called_once_with()
+        rsync.wait.assert_called_once_with()
+        assert _errors(caplog) == [
+            "rsync did not finish within 0s; stopping it"
+        ]
+
+    def test_real_mount_dying_stops_a_real_rsync(
+        self,
+        standin: _StandinBorg,
+        tmp_path: Path,
+        mock_cfg: Any,
+        caplog: Any,
+    ) -> None:
+        """Against real processes: a mount that dies mid-rsync stops the
+        rsync and is reported once -- not again when the run's mounts are
+        reaped."""
+        stand_in_rsync = _StandinBorg(
+            tmp_path / "rsync", mock_cfg.LOCK_CHECK_TIMEOUT
+        )
+        standin.set_mode("serve")
+        stand_in_rsync.set_mode("serve")
+        mount = ba.RunningCmd(standin.command("mount"))
+        standin.wait_serving()
+        rsync = ba.RunningCmd(stand_in_rsync.command("rsync"))
+        stand_in_rsync.wait_serving()
+        standin.touch("die")
+        with pytest.raises(berr.BorgadmError, match="Lost the mount"):
+            ba._wait_for_rsync(rsync, [(standin.mount_dir, mount)])
+        assert rsync.poll() == -signal.SIGTERM
+        ba._reap_mounts([mount], report=True)
+        errors = _errors(caplog)
+        assert errors[0] == (
+            "borg mount of home-1of2 exited (exit code 2) while rsync was "
+            "running; stopping rsync"
+        )
+        assert errors[1].startswith(
+            f"Command {mount.cmd_str} failed with exit code 2 and stderr:\n"
+            "starting\nTraceback: boom"
+        )
+        assert len(errors) == 2
 
 
 class TestDoEnvironment:
