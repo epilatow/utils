@@ -2869,11 +2869,19 @@ class TestRunningCmd:
         logs = [cast(Path, run.ssh_log) for run in runs]
         assert logs[0] != logs[1]
         assert {log.parent for log in logs} == {ssh_logs}
-        rshs = [shlex.split(cast(str, a["rsh"])) for a in standin.attempts()]
-        assert rshs == [
-            ["ssh", "-F", "/dev/null", "-o", "LogLevel=DEBUG1", "-E", str(log)]
-            for log in logs
-        ]
+        # The two run at once, so each stand-in records its attempt
+        # whenever it gets to; they are matched to their runs by pid.
+        rsh_by_pid = {
+            a["pid"]: shlex.split(cast(str, a["rsh"]))
+            for a in standin.attempts()
+        }
+        assert rsh_by_pid == {
+            run.proc.pid: [
+                *["ssh", "-F", "/dev/null", "-o", "LogLevel=DEBUG1"],
+                *["-E", str(log)],
+            ]
+            for run, log in zip(runs, logs, strict=True)
+        }
         assert os.environ["BORG_RSH"] == "ssh -F /dev/null"
 
     @pytest.mark.usefixtures("ssh_logs")
