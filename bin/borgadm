@@ -2596,6 +2596,14 @@ def do_compact(progress: bool) -> None:
     run_borg(borg_cmd() + args, repo_write=True, allow_output=progress)
 
 
+def _borg_option(option: str, value: str) -> str:
+    """`option` with `value` attached, as one argument. Depending on the
+    Python borg runs under, its argument parser takes a separate value
+    that starts with '-' -- an exclusion pattern such as `-re:...` -- for
+    another option and rejects the command; attached, it cannot."""
+    return f"{option}={value}"
+
+
 def _create_keep_options(options: list[str], description: str) -> list[str]:
     """Merge a keep tag into the configured Borg create comment."""
     remaining: list[str] = []
@@ -2726,9 +2734,9 @@ def do_create(
                 )
                 excludes.extend(auto_excludes)
         for e in excludes:
-            create_args += ["--exclude", e]
+            create_args.append(_borg_option("--exclude", e))
         for pattern in set_cfg.get("patterns", []):
-            create_args += ["--pattern", pattern]
+            create_args.append(_borg_option("--pattern", pattern))
         archive_name = _ArchiveName(
             backup_name=cfg.BACKUP_NAME,
             set_name=set_name,
@@ -2819,7 +2827,7 @@ def do_extract(
             logger.info(f"Getting archive contents: {archive_ref}")
             cmd = borg_cmd() + ["list", "--format", "{type} {path}{NL}"]
             for pattern in patterns:
-                cmd += ["--pattern", pattern]
+                cmd.append(_borg_option("--pattern", pattern))
             cmd.append(archive_ref)
             proc = run_borg(cmd, repo_write=False, bypass_lock=bypass_lock)
             for line in proc.stdout.splitlines():
@@ -2914,7 +2922,7 @@ def do_extract(
             if dry_run:
                 cmd.append("--dry-run")
             for pattern in patterns:
-                cmd += ["--pattern", pattern]
+                cmd.append(_borg_option("--pattern", pattern))
             cmd.append(archive_ref)
             run_borg(
                 cmd,

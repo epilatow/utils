@@ -5334,20 +5334,71 @@ class TestCreatePatterns:
         ):
             ba.do_create(False, False, True, root=str(tmp_path), keep=None)
         first = run.call_args_list[0].args[0]
-        start = first.index("--pattern")
-        expected = [
-            arg for pattern in patterns for arg in ("--pattern", pattern)
-        ]
+        # Each value is attached to its option, so one starting with '-'
+        # (the exclusion pattern here) cannot be read as another option.
+        expected = [f"--pattern={pattern}" for pattern in patterns]
+        start = first.index(expected[0])
         assert first[start : start + len(expected)] == expected
-        assert first.index("--compression=lz4") < first.index("--exclude")
-        assert all(
-            index < start
+        excludes = [
+            index
             for index, arg in enumerate(first)
-            if arg == "--exclude"
+            if arg.startswith("--exclude=")
+        ]
+        assert first.index("--compression=lz4") < excludes[0]
+        assert all(index < start for index in excludes)
+        assert "--exclude=sh:**/protected" in first
+        assert ("--exclude=Library/Mobile Documents" in first) == (
+            system == "Darwin"
         )
-        assert ("Library/Mobile Documents" in first) == (system == "Darwin")
-        assert "--pattern" not in run.call_args_list[1].args[0]
+        assert not any(
+            arg.startswith("--pattern") for arg in run.call_args_list[1].args[0]
+        )
         assert json.dumps(mock_cfg.BACKUP_SETS) == original
+
+
+class TestExtractPatterns:
+    def test_patterns_are_attached_to_their_option(
+        self, mock_cfg: ba.Config, tmp_path: Path
+    ) -> None:
+        """Both the listing behind --delete and the extract itself pass
+        each pattern attached, so an exclusion pattern starting with '-'
+        cannot be read as another option."""
+        archive = f"{mock_cfg.BORG_REPO}::home-set1-20260101_000000_1of1"
+        patterns = ["-sh:**/cache", "+pp:docs"]
+        target = tmp_path / "target"
+        target.mkdir()
+        with (
+            patch.object(
+                ba,
+                "_selected_backup",
+                autospec=True,
+                return_value=("20260101_000000", [archive]),
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(
+                ba,
+                "run_borg",
+                autospec=True,
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
+        ):
+            ba.do_extract(
+                target,
+                patterns,
+                dry_run=False,
+                delete=True,
+                progress=False,
+                bypass_lock=False,
+                archive=None,
+            )
+        commands = [c.args[0] for c in run.call_args_list]
+        assert [cmd[1] for cmd in commands] == ["list", "extract"]
+        for cmd in commands:
+            assert cmd[-3:] == [
+                "--pattern=-sh:**/cache",
+                "--pattern=+pp:docs",
+                archive,
+            ]
 
 
 @pytest.mark.e2e
