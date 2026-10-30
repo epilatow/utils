@@ -2663,11 +2663,18 @@ class TestInitializeBorgEnvironmentSshGating:
         self, monkeypatch: Any, mock_cfg: Any
     ) -> Iterator[Any]:
         """Reset the once-per-process init flag plus the env vars the
-        function touches so each test sees a clean slate."""
+        function touches so each test sees a clean slate, and restore
+        the environment it wrote afterwards."""
         monkeypatch.setattr(ba, "_borg_env_initialized", False)
-        for var in ("BORG_RSH", "BORG_PASSPHRASE", "BORG_REMOTE_PATH"):
-            monkeypatch.delenv(var, raising=False)
-        yield mock_cfg
+        with patch.dict(os.environ):
+            for var in (
+                "BORG_RSH",
+                "BORG_PASSPHRASE",
+                "BORG_PASSCOMMAND",
+                "BORG_REMOTE_PATH",
+            ):
+                os.environ.pop(var, None)
+            yield mock_cfg
         monkeypatch.setattr(ba, "_borg_env_initialized", False)
 
     @contextlib.contextmanager
@@ -2675,7 +2682,7 @@ class TestInitializeBorgEnvironmentSshGating:
         """Patch the side-effecting helpers and yield the ssh-agent
         mock so tests can assert against its call status."""
         with (
-            patch.object(ba, "load_passphrase", return_value="pw"),
+            patch.object(ba, "check_passphrase_file", autospec=True),
             patch.object(ba, "start_ssh_agent", autospec=True) as mock_agent,
             patch.object(ba.CFG, "BORG_REPO", repo),
             patch.object(ba.CFG, "BORG_REPO_HOSTKEY", "fake-hostkey"),
@@ -2687,7 +2694,7 @@ class TestInitializeBorgEnvironmentSshGating:
             ba.initialize_borg_environment()
             assert mock_agent.called is False
         assert "BORG_RSH" not in os.environ
-        assert os.environ.get("BORG_PASSPHRASE") == "pw"
+        assert os.environ["BORG_PASSCOMMAND"] == ba.passphrase_command()
 
     def test_ssh_scheme_runs_ssh_setup(self) -> None:
         with self._patch_externals("ssh://user@host/srv/borg") as mock_agent:
@@ -2711,6 +2718,107 @@ class TestInitializeBorgEnvironmentSshGating:
         assert f"-o ConnectTimeout={ba.get_cfg().CMD_TIMEOUT}" in rsh
         assert "-o ServerAliveInterval=15" in rsh
         assert "-o ServerAliveCountMax=30" in rsh
+
+
+class TestPassphraseFile:
+    """borg reads the passphrase through a command that prints the
+    configured file, so the passphrase never enters an environment."""
+
+    @pytest.fixture(name="passphrase_file", autouse=True)
+    def passphrase_file(
+        self, monkeypatch: Any, mock_cfg: Any, tmp_path: Path
+    ) -> Iterator[Path]:
+        """Point the config at a passphrase file in a directory whose
+        name needs quoting, with a clean borg environment that is
+        restored afterwards."""
+        monkeypatch.setattr(ba, "_borg_env_initialized", False)
+        path = tmp_path / "it's here" / "passphrase"
+        path.parent.mkdir()
+        with (
+            patch.dict(os.environ),
+            patch.object(mock_cfg, "BORG_PASSPHRASE_FILE", path),
+            patch.object(mock_cfg, "BORG_REPO", "/var/backups/borg"),
+        ):
+            for var in ("BORG_PASSPHRASE", "BORG_PASSCOMMAND"):
+                os.environ.pop(var, None)
+            yield path
+        monkeypatch.setattr(ba, "_borg_env_initialized", False)
+
+    @staticmethod
+    def _write(path: Path, text: str) -> None:
+        path.write_text(text)
+        path.chmod(0o600)
+
+    def test_environment_carries_command_not_passphrase(
+        self, passphrase_file: Path
+    ) -> None:
+        """An inherited BORG_PASSPHRASE is dropped: borg would prefer it
+        to the configured file."""
+        self._write(passphrase_file, "secret\n")
+        os.environ["BORG_PASSPHRASE"] = "inherited"
+        ba.initialize_borg_environment()
+        assert "BORG_PASSPHRASE" not in os.environ
+        assert os.environ["BORG_PASSCOMMAND"] == ba.passphrase_command()
+        assert not any("secret" in v for v in os.environ.values())
+
+    def test_command_reads_a_relative_file_from_anywhere(
+        self, passphrase_file: Path, monkeypatch: Any
+    ) -> None:
+        """borg runs the command in its own working directory, so a
+        relative path resolves against borgadm's, as the check does."""
+        self._write(passphrase_file, "secret\n")
+        base = passphrase_file.parent.parent
+        monkeypatch.chdir(base)
+        relative = passphrase_file.relative_to(base)
+        with patch.object(ba.CFG, "BORG_PASSPHRASE_FILE", relative):
+            ba.check_passphrase_file()
+            command = ba.passphrase_command()
+        output = subprocess.check_output(
+            shlex.split(command), text=True, cwd="/"
+        )
+        assert output.rstrip("\n") == "secret"
+
+    def test_environment_requires_a_valid_file(
+        self, passphrase_file: Path
+    ) -> None:
+        self._write(passphrase_file, "secret \n")
+        with pytest.raises(berr.ConfigError, match="whitespace around"):
+            ba.initialize_borg_environment()
+        assert "BORG_PASSCOMMAND" not in os.environ
+
+    @pytest.mark.parametrize(
+        "text", ["secret", "secret\n", "secret\n\n", "secret\r\n"]
+    )
+    def test_accepts_what_borg_reads_as_the_passphrase(
+        self, passphrase_file: Path, text: str
+    ) -> None:
+        """borg splits the command with shlex, reads its output with
+        newline translation, and drops trailing newlines; for an accepted
+        file that leaves exactly the passphrase."""
+        self._write(passphrase_file, text)
+        ba.check_passphrase_file()
+        output = subprocess.check_output(
+            shlex.split(ba.passphrase_command()), text=True
+        )
+        assert output.rstrip("\n") == "secret"
+
+    @pytest.mark.parametrize("text", [" secret\n", "secret \n", "\tsecret"])
+    def test_rejects_other_surrounding_whitespace(
+        self, passphrase_file: Path, text: str
+    ) -> None:
+        self._write(passphrase_file, text)
+        with pytest.raises(berr.ConfigError, match="whitespace around"):
+            ba.check_passphrase_file()
+
+    def test_rejects_open_permissions(self, passphrase_file: Path) -> None:
+        self._write(passphrase_file, "secret\n")
+        passphrase_file.chmod(0o644)
+        with pytest.raises(berr.ConfigError, match="too open"):
+            ba.check_passphrase_file()
+
+    def test_rejects_missing_file(self) -> None:
+        with pytest.raises(berr.ConfigError, match="not found"):
+            ba.check_passphrase_file()
 
 
 # The class itself, for specs of fakes built while tests have
@@ -4131,7 +4239,8 @@ class TestWaitForRsync:
 
 
 class TestDoEnvironment:
-    """do_environment prints ssh-add only for remote BORG_REPO."""
+    """do_environment prints the shell setup for running borg directly,
+    with ssh-add only for a remote BORG_REPO."""
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_local_repo_omits_ssh_add(self, caplog: Any) -> None:
@@ -4142,8 +4251,33 @@ class TestDoEnvironment:
             ba.do_environment()
         messages = [r.message for r in caplog.records]
         assert not any("ssh-add" in m for m in messages)
-        assert any("export BORG_PASSPHRASE=" in m for m in messages)
         assert any("export BORG_REPO=" in m for m in messages)
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_prints_shell_commands(self, caplog: Any) -> None:
+        """Every line parses back to its exact values in a shell. The
+        passphrase reaches borg only through the command borgadm gives
+        it, with any BORG_PASSPHRASE, which borg would prefer, unset."""
+        with (
+            patch.object(ba.CFG, "BORG_REPO", "user@host:/srv/my borg"),
+            patch.object(ba.CFG, "BORG_SSHKEY_FILE", Path("/home/a b/key")),
+            patch.object(
+                ba.CFG,
+                "BORG_PASSPHRASE_FILE",
+                Path("/home/it's here/passphrase"),
+            ),
+            patch.object(ba.CFG, "BORG_REMOTE_PATH", "/opt/borg 14/borg"),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.do_environment()
+            command = ba.passphrase_command()
+        assert [shlex.split(r.message) for r in caplog.records] == [
+            ["ssh-add", "-q", "/home/a b/key"],
+            ["unset", "BORG_PASSPHRASE"],
+            ["export", f"BORG_PASSCOMMAND={command}"],
+            ["export", "BORG_REPO=user@host:/srv/my borg"],
+            ["export", "BORG_REMOTE_PATH=/opt/borg 14/borg"],
+        ]
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_remote_repo_emits_ssh_add(self, caplog: Any) -> None:
@@ -5191,6 +5325,56 @@ class TestE2EFixture:
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+
+
+@pytest.mark.e2e
+class TestE2EEncryptedRepo:
+    """borgadm unlocks an encrypted repository with the configured
+    passphrase file, whatever BORG_PASSPHRASE its caller exports."""
+
+    @pytest.fixture(name="encrypted_repo")
+    def encrypted_repo(
+        self,
+        borg_e2e: BorgE2EFixture,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> BorgE2EFixture:
+        """Point borg_e2e's config at a new repokey repository encrypted
+        with the passphrase in its passphrase file, then export a wrong
+        BORG_PASSPHRASE to every later command."""
+        passphrase_file = borg_e2e.home / ".borg_passphrase"
+        repo = tmp_path / "encrypted-repo"
+        monkeypatch.setenv(
+            "BORG_PASSPHRASE", passphrase_file.read_text().rstrip("\n")
+        )
+        borg_e2e.borg("init", "--encryption=repokey", str(repo))
+        monkeypatch.setenv("BORG_PASSPHRASE", "not-the-passphrase")
+
+        repo_line = f"BORG_REPO = {borg_e2e.repo_path}\n"
+        config = borg_e2e.config_path.read_text()
+        assert repo_line in config
+        borg_e2e.config_path.write_text(
+            config.replace(repo_line, f"BORG_REPO = {repo}\n")
+        )
+        borg_e2e.repo_path = repo
+        return borg_e2e
+
+    def test_list_unlocks_with_passphrase_file(
+        self, encrypted_repo: BorgE2EFixture
+    ) -> None:
+        result = encrypted_repo.run("list", check=False)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    def test_list_fails_with_wrong_passphrase_file(
+        self, encrypted_repo: BorgE2EFixture
+    ) -> None:
+        """Control: the file is what unlocks the repository."""
+        (encrypted_repo.home / ".borg_passphrase").write_text("wrong\n")
+        result = encrypted_repo.run("list", check=False)
+        assert result.returncode != 0
+        assert "is incorrect" in result.stdout + result.stderr
 
 
 class TestArchiveCompleteness:

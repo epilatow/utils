@@ -725,7 +725,11 @@ def initialize_borg_environment() -> None:
     if cfg.BORG_REMOTE_PATH:
         os.environ["BORG_REMOTE_PATH"] = cfg.BORG_REMOTE_PATH
         logger.debug(f"BORG_REMOTE_PATH={os.environ['BORG_REMOTE_PATH']}")
-    os.environ["BORG_PASSPHRASE"] = load_passphrase()
+    check_passphrase_file()
+    # borg prefers BORG_PASSPHRASE to BORG_PASSCOMMAND, so one inherited
+    # from the caller would override the configured file.
+    os.environ.pop("BORG_PASSPHRASE", None)
+    os.environ["BORG_PASSCOMMAND"] = passphrase_command()
     if _is_remote_repo(cfg.BORG_REPO):
         _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
         _hostkey_file.flush()
@@ -767,8 +771,8 @@ def pump_stream(
 
 
 # How a command is run as root: non-interactively, keeping the caller's
-# environment (borg reads its passphrase, BORG_RSH and ssh-agent socket
-# from it). check_sudo() verifies exactly these flags.
+# environment (borg reads its passphrase command, BORG_RSH and ssh-agent
+# socket from it). check_sudo() verifies exactly these flags.
 _SUDO_ARGV: tuple[str, ...] = ("sudo", "-n", "-E")
 
 
@@ -1204,12 +1208,37 @@ def stop_ssh_agent() -> None:
         _ssh_agent_pid = None
 
 
-def load_passphrase() -> str:
+def passphrase_command() -> str:
+    """The BORG_PASSCOMMAND that prints the configured passphrase file.
+
+    borg runs it and reads the passphrase from its output, so the
+    passphrase itself never enters an environment: not borgadm's, and not
+    those of the commands it runs through sudo, which some sudo
+    configurations log. The path is absolute because borg runs the
+    command in its own working directory, which need not be borgadm's.
+    """
+    cfg = get_cfg()
+    return shlex.join(["cat", cfg.BORG_PASSPHRASE_FILE.absolute().as_posix()])
+
+
+def check_passphrase_file() -> None:
+    """Fail unless borg can read the passphrase file as it is meant.
+
+    borg drops only trailing newlines from a passphrase command's output,
+    so any other whitespace around the passphrase would silently become
+    part of it.
+    """
     cfg = get_cfg()
 
-    check_permissions(cfg.BORG_PASSPHRASE_FILE, "BORG_PASSPHRASE file")
-    with open(cfg.BORG_PASSPHRASE_FILE) as f:
-        return f.read().strip()
+    path = cfg.BORG_PASSPHRASE_FILE
+    check_permissions(path, "BORG_PASSPHRASE file")
+    with open(path) as f:
+        text = f.read()
+    if text.rstrip("\n") != text.strip():
+        raise ConfigError(
+            f"BORG_PASSPHRASE file ({path}) has whitespace around the "
+            "passphrase other than trailing newlines."
+        )
 
 
 @functools.cache
@@ -3392,11 +3421,17 @@ def do_repair_full(progress: bool) -> None:
 def do_environment() -> None:
     cfg = get_cfg()
     if _is_remote_repo(cfg.BORG_REPO):
-        logger.info(f"ssh-add -q {cfg.BORG_SSHKEY_FILE}")
-    logger.info(f"export BORG_PASSPHRASE=$(cat {cfg.BORG_PASSPHRASE_FILE})")
-    logger.info(f"export BORG_REPO={cfg.BORG_REPO}")
+        logger.info(
+            f"ssh-add -q {shlex.quote(cfg.BORG_SSHKEY_FILE.as_posix())}"
+        )
+    # borg prefers BORG_PASSPHRASE to BORG_PASSCOMMAND.
+    logger.info("unset BORG_PASSPHRASE")
+    logger.info(f"export BORG_PASSCOMMAND={shlex.quote(passphrase_command())}")
+    logger.info(f"export BORG_REPO={shlex.quote(cfg.BORG_REPO)}")
     if cfg.BORG_REMOTE_PATH:
-        logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
+        logger.info(
+            f"export BORG_REMOTE_PATH={shlex.quote(cfg.BORG_REMOTE_PATH)}"
+        )
 
 
 _CONFIG_HEADER = """\
