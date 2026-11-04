@@ -9,6 +9,7 @@
 
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -302,6 +303,72 @@ class TestLogsAlias:
             crony_model.JITTER_SUBCOMMAND,
         ):
             assert hidden not in listed
+
+
+class TestDefaultConfigDiscovery:
+    @pytest.mark.parametrize("legacy", [None, "default.toml", "config.toml"])
+    def test_cli_creates_canonical_config_or_reuses_compatibility_file(
+        self, tmp_path: Path, legacy: str | None
+    ) -> None:
+        cfg_dir = tmp_path / "crony"
+        canonical = cfg_dir / "config" / "default.toml"
+        env = dict(os.environ)
+        env.pop("CRONY_CONFIG_FILE", None)
+        env["CRONY_CONFIG_DIR"] = str(cfg_dir)
+        env["CRONY_CONFIG_DROPIN_DIR"] = str(canonical.parent)
+        if legacy is None:
+            args = ["config", "init"]
+            target = canonical
+        else:
+            target = cfg_dir / legacy
+            cfg_dir.mkdir()
+            target.write_text("", encoding="utf-8")
+            args = ["config", "init", "--force"]
+        result = subprocess.run(
+            [str(_script_path), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "[defaults]" in target.read_text()
+        assert canonical.exists() == (legacy is None)
+
+    @pytest.mark.parametrize(
+        "locations",
+        [
+            ("config/default.toml", "default.toml"),
+            ("config/default.toml", "config.toml"),
+            ("default.toml", "config.toml"),
+            ("config/default.toml", "default.toml", "config.toml"),
+        ],
+    )
+    def test_cli_conflicts_exit_config_and_leave_files_untouched(
+        self, tmp_path: Path, locations: tuple[str, ...]
+    ) -> None:
+        cfg_dir = tmp_path / "crony"
+        dropin = cfg_dir / "config"
+        dropin.mkdir(parents=True)
+        paths = [cfg_dir / name for name in locations]
+        for path in paths:
+            path.write_text("", encoding="utf-8")
+        env = dict(os.environ)
+        env.pop("CRONY_CONFIG_FILE", None)
+        env["CRONY_CONFIG_DIR"] = str(cfg_dir)
+        env["CRONY_CONFIG_DROPIN_DIR"] = str(dropin)
+        result = subprocess.run(
+            [str(_script_path), "config", "update"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == int(ExitCode.CONFIG), result.stderr
+        assert "multiple default config files" in result.stderr
+        for path in paths:
+            assert str(path) in result.stderr
+            assert path.read_text() == ""
 
 
 class TestConfigSubcommandDispatch:

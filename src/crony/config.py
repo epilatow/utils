@@ -1239,26 +1239,49 @@ class TomlBundle:
         return cls(name=name, source=path, config=config)
 
 
+def default_config_file() -> Path:
+    """The existing default config, or its creation path when absent.
+
+    Multiple default locations are a hard error, even if one does not
+    parse. Choosing one would silently ignore another configuration.
+    """
+    candidates = crony.paths.default_config_paths()
+    existing = [path for path in candidates if path.exists()]
+    if len(existing) > 1:
+        paths = ", ".join(str(path) for path in existing)
+        raise crony.errors.ConfigError(
+            f"multiple default config files exist: {paths}; "
+            "keep only one default config file"
+        )
+    return existing[0] if existing else candidates[0]
+
+
 def bundle_candidates() -> list[tuple[str, Path]]:
     """Every config file that could supply a bundle, in load order.
 
-    `config.toml` first, then `config/*.toml` lex-sorted. Whether each
+    The default config first, then other `config/*.toml` lex-sorted.
+    Multiple default locations raise ConfigError. Whether each
     one parses is the caller's problem; this answers only which files
     are candidates and what each would be called. The single enumerator,
     so a loader and a rewriter cannot disagree about what a bundle is.
     """
     paths: list[Path] = []
-    if crony.paths.CONFIG_FILE.exists():
-        paths.append(crony.paths.CONFIG_FILE)
+    default = default_config_file()
+    if default.exists():
+        paths.append(default)
     if crony.paths.CONFIG_DROPIN_DIR.exists():
-        paths.extend(sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")))
+        paths.extend(
+            path
+            for path in sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml"))
+            if path != default
+        )
     return [(bundle_name_for_path(path), path) for path in paths]
 
 
 def bundle_name_for_path(path: Path) -> str:
     """The bundle name a config file supplies.
 
-    `config.toml` is the `default` bundle; a drop-in under `config/` is
+    A default-config location supplies `default`; another drop-in is
     named after its filename stem. `bundle_candidates` names each
     candidate through here, and a consumer holding only a path -- an
     errored bundle is keyed by one, having never parsed far enough to
@@ -1272,12 +1295,10 @@ def bundle_name_for_path(path: Path) -> str:
     path denotes the config file is a different question, and a caller
     holding user-supplied input resolves before deciding.
 
-    Names are not guaranteed distinct: point the drop-in dir at the
-    directory holding the config file and it is enumerated twice, once
-    under each rule. The loader rejects the second as a collision,
-    which is the honest answer for a layout that names one file twice.
+    Candidate paths are compared without resolving symlinks so that
+    distinct named drop-ins remain distinct bundles.
     """
-    if path == crony.paths.CONFIG_FILE:
+    if path in crony.paths.default_config_paths():
         return DEFAULT_BUNDLE_NAME
     return path.stem
 
@@ -1285,7 +1306,7 @@ def bundle_name_for_path(path: Path) -> str:
 @dataclass
 class TomlConfig:
     """All loaded bundles, keyed by bundle name. Order is the load
-    order (config.toml first, then config/*.toml lex-sorted).
+    order (default config first, then other config/*.toml lex-sorted).
 
     `errored_bundles` records per-file parse / validation failures
     (source path -> message) so a config that's broken in one bundle
@@ -1302,8 +1323,10 @@ class TomlConfig:
 
     @classmethod
     def load_all(cls) -> TomlConfig:
-        """Load every bundle: `config.toml` (-> bundle 'default') plus
-        `config/*.toml` (each -> bundle named after its filename stem).
+        """Load the default bundle plus other `config/*.toml` bundles
+        named after their filename stems.
+
+        Multiple default config files raise ConfigError before loading.
 
         Per-bundle failures are isolated: a bundle that fails to parse,
         fails schema validation, or has an invalid filename is recorded
@@ -1775,7 +1798,7 @@ def _typed_field(
 # cleanly into `<bundle>.foo.bar` on disk.
 _NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# TomlBundle names come from filenames (config.toml -> "default";
+# TomlBundle names come from filenames (default config -> "default";
 # config/<x>.toml -> "x"). The dot is reserved as the namespace
 # separator between bundle and short name, so bundle names cannot
 # themselves contain dots.
@@ -2250,7 +2273,7 @@ def _parse_notify_success_ratio(
 def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     """Parse [defaults].
 
-    `is_default` flags the default bundle (config.toml). A non-default
+    `is_default` flags the default bundle. A non-default
     bundle that omits `notify-channels` entirely inherits the default
     bundle's notify config (the [NOTIFY_INHERIT_TOKEN] sentinel);
     explicit `notify-channels = []` opts back out to silence.

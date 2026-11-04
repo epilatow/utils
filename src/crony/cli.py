@@ -89,8 +89,15 @@ Subcommands fall into categories:
 - operational (`status`, `logs`, `start`, `stop`): manage deployed jobs
 
 Configuration is managed via bundles:
-- `~/.config/crony/config.toml` -> bundle name "default"
+- `~/.config/crony/config/default.toml` -> bundle name "default"
 - `~/.config/crony/config/<x>.toml` -> bundle name "<x>"
+
+If config/default.toml is absent crony will try the following "default"
+bundle fallback paths:
+- ~/.config/crony/default.toml
+- ~/.config/crony/config.toml
+
+Crony fails if multiple "default" config bundle paths exist.
 
 Bundles are independent. Job and group names are namespaced as
 <bundle>.<name>; bare CLI input (`crony start foo`) is shorthand for
@@ -278,13 +285,11 @@ def _guard_cap(value: str) -> int:
 def _validate_config_init(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject `config init --bundle default`: the default bundle is
-    config.toml, which a `config/default.toml` drop-in would shadow."""
+    """Require plain `config init` to initialize the default bundle."""
     if args.bundle == crony.config.DEFAULT_BUNDLE_NAME:
         parser.error(
-            f"--bundle {crony.config.DEFAULT_BUNDLE_NAME!r} would shadow "
-            f"config.toml; use plain `crony config init` (without "
-            f"--bundle) for the default bundle"
+            "use plain `crony config init` (without "
+            "--bundle) for the default bundle"
         )
 
 
@@ -409,7 +414,8 @@ def _build_parser() -> StrictArgumentParser:
         help="Generate a default config file.",
         description=(
             "Generate a default config file. With --bundle, write "
-            "config/<bundle>.toml instead of config.toml."
+            "config/<bundle>.toml instead of config/default.toml. "
+            "An existing compatibility config is reused."
         ),
     )
     p_config_init.add_argument(
@@ -442,7 +448,7 @@ def _build_parser() -> StrictArgumentParser:
         help=(
             "Structurally validate a single TOML file as a bundle "
             "(named after its stem, or 'default' for the installed "
-            "config.toml), independent of the config dir. Exits "
+            "default config), independent of the config dir. Exits "
             "non-zero on any error. Lets a tool pre-flight a bundle."
         ),
     )

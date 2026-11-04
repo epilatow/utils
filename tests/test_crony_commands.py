@@ -102,9 +102,10 @@ class TestInit:
         doesn't touch the user's real ~/.config/crony.
         """
         cfg_dir = tmp_path / "crony"
-        cfg_file = cfg_dir / "config.toml"
+        cfg_file = cfg_dir / "config" / "default.toml"
         monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_file.parent)
         return cfg_file
 
     def test_creates_file_when_absent(
@@ -148,6 +149,37 @@ class TestInit:
         body = cfg_file.read_text(encoding="utf-8")
         assert "user content" not in body
         assert "[defaults]" in body
+
+    @pytest.mark.parametrize("filename", ["default.toml", "config.toml"])
+    def test_existing_compatibility_config_is_reused(
+        self, tmp_path: Path, monkeypatch: Any, filename: str
+    ) -> None:
+        canonical = self._redirect_config(monkeypatch, tmp_path)
+        legacy = crony_paths.CONFIG_DIR / filename
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("user content", encoding="utf-8")
+        with pytest.raises(UsageError, match="already exists"):
+            crony_commands.do_init(force=False, bundle=None)
+        assert legacy.read_text() == "user content"
+        assert not canonical.exists()
+        crony_commands.do_init(force=True, bundle=None)
+        assert "[defaults]" in legacy.read_text()
+        assert not canonical.exists()
+
+    @pytest.mark.parametrize("force", [False, True])
+    @pytest.mark.parametrize("bundle", [None, "other"])
+    def test_conflicting_defaults_prevent_init(
+        self, tmp_path: Path, monkeypatch: Any, force: bool, bundle: str | None
+    ) -> None:
+        canonical = self._redirect_config(monkeypatch, tmp_path)
+        canonical.parent.mkdir(parents=True)
+        legacy = crony_paths.CONFIG_DIR / "config.toml"
+        for path in (canonical, legacy):
+            path.write_text("user content", encoding="utf-8")
+        with pytest.raises(ConfigError, match="multiple default config files"):
+            crony_commands.do_init(force=force, bundle=bundle)
+        assert canonical.read_text() == legacy.read_text() == "user content"
+        assert not (canonical.parent / "other.toml").exists()
 
     def test_shipped_template_file_exists(self) -> None:
         """The package ships `default_config.toml` as data beside the
@@ -193,8 +225,8 @@ class TestInit:
         assert not cfg_file.exists()
 
     def test_bundle_default_rejected(self) -> None:
-        # `--bundle default` would shadow config.toml; the parser
-        # rejects it (exit 2) before dispatch.
+        # Plain init resolves compatibility locations for the default
+        # bundle; require that form before dispatch.
         with pytest.raises(SystemExit) as exc:
             crony_cli._build_parser().parse_command(
                 ["config", "init", "--bundle", "default"]
@@ -248,6 +280,22 @@ class TestConfigUpdateAction:
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         return cfg_file, cfg_dropin
+
+    @pytest.mark.parametrize(
+        "filename", ["config/default.toml", "default.toml", "config.toml"]
+    )
+    def test_updates_each_default_location(
+        self, tmp_path: Path, monkeypatch: Any, filename: str
+    ) -> None:
+        _, dropin = self._redirect(monkeypatch, tmp_path)
+        monkeypatch.setattr(crony_paths, "CONFIG_FILE", dropin / "default.toml")
+        path = crony_paths.CONFIG_DIR / filename
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            '[job.j]\ncommand = "true"\nschedule = "daily"\n', encoding="utf-8"
+        )
+        crony_commands.do_config_update(bundle="default")
+        assert "uuid" in tomlkit.loads(path.read_text())["job"]["j"]
 
     def test_fills_missing_uuids_in_default_bundle(
         self, tmp_path: Path, monkeypatch: Any
@@ -355,8 +403,14 @@ class TestConfigUpdateAction:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         self._redirect(monkeypatch, tmp_path)
-        with pytest.raises(ConfigError, match="no config"):
+        with pytest.raises(ConfigError, match="no config") as exc:
             crony_commands.do_config_update(bundle=None)
+        for path in (
+            crony_paths.CONFIG_DROPIN_DIR / "default.toml",
+            crony_paths.CONFIG_DIR / "default.toml",
+            crony_paths.CONFIG_DIR / "config.toml",
+        ):
+            assert str(path) in str(exc.value)
 
     def test_parse_error_in_one_file_does_not_block_others(
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
@@ -6162,8 +6216,7 @@ class TestValidate:
     def test_unparseable_bundle_is_reported(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # The other failed-bundle tests both trip a name collision;
-        # this is the parse-error construction site.
+        # Parse failures are reported alongside successfully loaded bundles.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.cfg_file.write_text(
             _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
@@ -6201,14 +6254,9 @@ class TestValidate:
         assert "name collision" in out
         assert "bundles loaded: 0, rejected=1" in out
 
-    def test_scoped_run_reports_a_file_contending_for_its_name(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    def test_scoped_validate_rejects_multiple_default_files(
+        self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # `--bundle` cannot name a file that failed to load -- only
-        # loaded bundles resolve. What it can reach is the file that
-        # lost a fight for this bundle's name: that failure belongs in
-        # this bundle's scoped report, since it is why the name resolves
-        # to the file it does.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.cfg_file.write_text(
             _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
@@ -6218,36 +6266,36 @@ class TestValidate:
             _uuid_toml('[job.other]\ncommand = "true"\nschedule = "daily"\n'),
             encoding="utf-8",
         )
-        with pytest.raises(SystemExit) as exc:
+        with pytest.raises(ConfigError, match="multiple default config files"):
             crony_commands.do_validate(bundle="default", file=None)
-        assert exc.value.code == int(ExitCode.WARNING)
-        out = capsys.readouterr().out
-        assert "collides with already-loaded bundle" in out
-        # The path appears once -- the message carries its own.
-        assert out.count("default.toml:") == 1
 
-    def test_scoped_run_reports_the_config_file_itself_failing(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    def test_scoped_validate_rejects_multiple_defaults_even_if_one_is_invalid(
+        self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # The `default` name can be supplied by a drop-in when
-        # config.toml itself fails, which is the one shape that reaches
-        # the CONFIG_FILE branch of the name derivation.
+        # A broken config still conflicts with another default config.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        h.cfg_file.write_text(
-            _uuid_toml(
-                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
-                '[job-group.a]\njobs = ["a"]\nschedule = "daily"\n'
-            ),
-            encoding="utf-8",
-        )
+        h.cfg_file.write_text("not TOML [[[", encoding="utf-8")
         (h.cfg_dropin / "default.toml").write_text(
             _uuid_toml('[job.other]\ncommand = "true"\nschedule = "daily"\n'),
             encoding="utf-8",
         )
-        with pytest.raises(SystemExit) as exc:
+        with pytest.raises(ConfigError, match="multiple default config files"):
             crony_commands.do_validate(bundle="default", file=None)
+
+    def test_broken_default_alone_is_reported_but_cannot_be_scoped(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text("not TOML [[[", encoding="utf-8")
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
         assert exc.value.code == int(ExitCode.WARNING)
-        assert "name collision" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "TOML parse error" in out
+        assert str(h.cfg_file) in out
+        assert "bundles loaded: 0, rejected=1" in out
+        with pytest.raises(UsageError, match="unknown bundle: 'default'"):
+            crony_commands.do_validate(bundle="default", file=None)
 
     def test_a_scheduled_group_member_fails_only_its_own_bundle(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any

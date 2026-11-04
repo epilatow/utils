@@ -2,10 +2,14 @@
 # crony config bundle
 # ============================================================================
 # crony reads bundles from:
-#   ~/.config/crony/config.toml      -> bundle name "default"
+#   ~/.config/crony/config/default.toml -> bundle name "default"
 #   ~/.config/crony/config/<x>.toml  -> bundle name "<x>"
 #                                       (filename stem matches
 #                                       [A-Za-z0-9][A-Za-z0-9_-]*)
+# Compatibility fallbacks when config/default.toml is absent:
+#   ~/.config/crony/default.toml
+#   ~/.config/crony/config.toml
+# Multiple default config files are an error; keep only one.
 # Each bundle is independent: its [defaults], targets, groups, and
 # notify config apply only to the jobs defined in the same file. The
 # one cross-bundle tie is notification inheritance: a non-default

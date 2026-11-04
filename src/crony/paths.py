@@ -38,10 +38,32 @@ def _env_path(key: str, default: str | None = None) -> Path | None:
 CONFIG_DIR: Path = _env_path(
     "CONFIG_DIR", os.path.expanduser(f"~/.config/{BASENAME}")
 )
-CONFIG_FILE: Path = _env_path("CONFIG_FILE", str(CONFIG_DIR / "config.toml"))
 CONFIG_DROPIN_DIR: Path = _env_path(
     "CONFIG_DROPIN_DIR", str(CONFIG_DIR / "config")
 )
+CONFIG_FILE: Path = _env_path(
+    "CONFIG_FILE", str(CONFIG_DROPIN_DIR / "default.toml")
+)
+
+
+def default_config_paths() -> list[Path]:
+    """Default-bundle locations, including an explicit file override.
+
+    Keep distinct path spellings even when they symlink to one file:
+    multiple default locations are ambiguous and must be reported.
+    """
+    return list(
+        dict.fromkeys(
+            (
+                CONFIG_FILE,
+                CONFIG_DROPIN_DIR / "default.toml",
+                CONFIG_DIR / "default.toml",
+                CONFIG_DIR / "config.toml",
+            )
+        )
+    )
+
+
 STATE_DIR: Path = _env_path(
     "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
 )

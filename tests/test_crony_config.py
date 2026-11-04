@@ -2474,8 +2474,78 @@ class TestGenerateUuidAction:
         assert str(parsed) == out
 
 
+class TestDefaultConfigPaths:
+    def _setup(self, tmp_path: Path, monkeypatch: Any) -> list[Path]:
+        cfg_dir = tmp_path / "crony"
+        dropin = cfg_dir / "config"
+        dropin.mkdir(parents=True)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", dropin)
+        monkeypatch.setattr(crony_paths, "CONFIG_FILE", dropin / "default.toml")
+        return [
+            dropin / "default.toml",
+            cfg_dir / "default.toml",
+            cfg_dir / "config.toml",
+        ]
+
+    @pytest.mark.parametrize("location", [0, 1, 2])
+    def test_loads_each_default_location_once_before_other_bundles(
+        self, tmp_path: Path, monkeypatch: Any, location: int
+    ) -> None:
+        paths = self._setup(tmp_path, monkeypatch)
+        paths[location].write_text("", encoding="utf-8")
+        other = crony_paths.CONFIG_DROPIN_DIR / "aaa.toml"
+        other.write_text("", encoding="utf-8")
+        assert crony_config.default_config_file() == paths[location]
+        assert crony_config.bundle_candidates() == [
+            ("default", paths[location]),
+            ("aaa", other),
+        ]
+        loaded = TomlConfig.load_all()
+        assert [bundle.name for bundle in loaded.bundles] == ["default", "aaa"]
+        assert loaded.errored_bundles == {}
+
+    @pytest.mark.parametrize("locations", [(0, 1), (0, 2), (1, 2), (0, 1, 2)])
+    @pytest.mark.parametrize("text", ["", "not TOML [[["])
+    def test_conflicts_fail_before_parsing_and_list_all_paths(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        locations: tuple[int, ...],
+        text: str,
+    ) -> None:
+        paths = self._setup(tmp_path, monkeypatch)
+        for i in locations:
+            paths[i].write_text(text, encoding="utf-8")
+        with pytest.raises(
+            ConfigError, match="multiple default config files"
+        ) as exc:
+            TomlConfig.load_all()
+        for i in locations:
+            assert str(paths[i]) in str(exc.value)
+
+    def test_symlinked_default_locations_still_conflict(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        paths = self._setup(tmp_path, monkeypatch)
+        paths[0].write_text("", encoding="utf-8")
+        paths[1].symlink_to(paths[0])
+        with pytest.raises(ConfigError, match="multiple default config files"):
+            TomlConfig.load_all()
+
+    def test_explicit_override_supplies_default_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        override = tmp_path / "custom.toml"
+        monkeypatch.setattr(crony_paths, "CONFIG_FILE", override)
+        assert crony_config.default_config_file() == override
+        override.write_text("", encoding="utf-8")
+        assert crony_config.bundle_candidates() == [("default", override)]
+
+
 class TestBundleLoading:
-    """`TomlConfig.load_all` discovers config.toml + config/*.toml,
+    """`TomlConfig.load_all` discovers the default + config/*.toml,
     isolates per-bundle failures, and rejects collisions."""
 
     def _setup(self, tmp_path: Path, monkeypatch: Any) -> tuple[Path, Path]:
@@ -2703,10 +2773,8 @@ class TestBundleLoading:
         )
 
     def test_default_dropin_filename_collides_with_config_toml(
-        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+        self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A user creates `config/default.toml`; that bundle name is
-        # already claimed by `config.toml`. The dropin is dropped.
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
             _uuid_toml(
@@ -2720,12 +2788,8 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
-            bundles = TomlConfig.load_all()
-        names = [b.name for b in bundles.bundles]
-        assert names == ["default"]
-        # The colliding dropin is referenced in the error.
-        assert any("default.toml" in r.message for r in caplog.records)
+        with pytest.raises(ConfigError, match="multiple default config files"):
+            TomlConfig.load_all()
 
     def test_symlinked_candidates_stay_distinct_bundles(
         self, tmp_path: Path, monkeypatch: Any
@@ -2755,18 +2819,11 @@ class TestBundleLoading:
         # Three display sites print these messages verbatim rather than
         # prefixing the source, so a message that leads with anything
         # else renders as an anonymous complaint in a column of paths.
-        # One case per construction site: bad filename, name collision,
+        # One case per construction site: bad filename,
         # unparseable TOML, and a bundle-level validation failure.
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
-        # Valid, so it claims `default` and the drop-in below collides;
-        # an invalid config.toml would leave the name free and that
-        # writer unexercised.
         cfg_file.write_text(
             _uuid_toml('[job.j]\ncommand = "true"\nschedule = "daily"\n'),
-            encoding="utf-8",
-        )
-        (dropin / "default.toml").write_text(
-            _uuid_toml('[job.k]\ncommand = "true"\nschedule = "daily"\n'),
             encoding="utf-8",
         )
         (dropin / "broken.toml").write_text(
@@ -2784,11 +2841,10 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         bundles = TomlConfig.load_all()
-        # Exactly the four failures the fixture builds -- a count that
+        # Exactly the three failures the fixture builds -- a count that
         # only floors would let a writer stop recording unnoticed.
         assert sorted(Path(s).name for s in bundles.errored_bundles) == [
             "broken.toml",
-            "default.toml",
             "dup.toml",
             "not a bundle name.toml",
         ]

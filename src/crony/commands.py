@@ -331,9 +331,11 @@ def do_init(force: bool, bundle: str | None) -> None:
     """Generate a default config file.
 
     With `--bundle <name>`, writes `config/<name>.toml` (creating
-    the dropin dir if missing). Otherwise writes `config.toml`.
+    the dropin dir if missing). Otherwise writes the default config.
+    An existing compatibility config is reused, including with --force.
     """
     template = _default_config_template()
+    default = crony.config.default_config_file()
     if bundle is not None:
         try:
             crony.config.validate_bundle_name(bundle, "--bundle")
@@ -348,14 +350,13 @@ def do_init(force: bool, bundle: str | None) -> None:
         target.write_text(template, encoding="utf-8")
         logger.info("wrote bundle config to %s", target)
         return
-    if crony.paths.CONFIG_FILE.exists() and not force:
+    if default.exists() and not force:
         raise crony.errors.UsageError(
-            f"{crony.paths.CONFIG_FILE} already exists; "
-            "pass --force to overwrite"
+            f"{default} already exists; pass --force to overwrite"
         )
-    crony.paths.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    crony.paths.CONFIG_FILE.write_text(template, encoding="utf-8")
-    logger.info("wrote default config to %s", crony.paths.CONFIG_FILE)
+    default.parent.mkdir(parents=True, exist_ok=True)
+    default.write_text(template, encoding="utf-8")
+    logger.info("wrote default config to %s", default)
 
 
 def do_generate_uuid() -> None:
@@ -435,8 +436,11 @@ def do_config_update(bundle: str | None) -> None:
     files = _bundle_files_for_update(bundle)
     if not files:
         if bundle is None:
+            defaults = ", ".join(
+                str(path) for path in crony.paths.default_config_paths()
+            )
             raise crony.errors.ConfigError(
-                f"no config: expected {crony.paths.CONFIG_FILE} or "
+                f"no config: expected a default config at {defaults}, or "
                 f"{crony.paths.CONFIG_DROPIN_DIR}/*.toml"
             )
         raise crony.errors.UsageError(
@@ -3350,7 +3354,7 @@ def _validate_file(path: Path) -> None:
     """Structurally validate a single TOML file as a bundle.
 
     The bundle name is derived exactly as the loader would for this
-    path: the installed default config file (`crony.paths.CONFIG_FILE`)
+    path: any installed default-config location
     is the `default` bundle, any other file is named after its stem (so
     `borgadm.toml` validates as bundle `borgadm`). That keeps the
     default-bundle-only rules (e.g. no notify-inherit sentinel) and
@@ -3374,7 +3378,9 @@ def _validate_file(path: Path) -> None:
     # asking whether it is the one, which is a different question from
     # `bundle_name_for_path`'s: that one names paths the loader
     # produced and compares them literally.
-    if path.resolve() == crony.paths.CONFIG_FILE.resolve():
+    if path.resolve() in {
+        candidate.resolve() for candidate in crony.paths.default_config_paths()
+    }:
         name = crony.config.DEFAULT_BUNDLE_NAME
     else:
         name = path.stem

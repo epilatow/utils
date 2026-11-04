@@ -42,8 +42,16 @@ Subcommands fall into categories:
 
 Configuration is managed via bundles:
 
-- `~/.config/crony/config.toml` -> bundle name "default"
+- `~/.config/crony/config/default.toml` -> bundle name "default"
 - `~/.config/crony/config/<x>.toml` -> bundle name "\<x>"
+
+If config/default.toml is absent crony will try the following "default" bundle
+fallback paths:
+
+- ~/.config/crony/default.toml
+- ~/.config/crony/config.toml
+
+Crony fails if multiple "default" config bundle paths exist.
 
 Bundles are independent. Job and group names are namespaced as
 \<bundle>.\<name>; bare CLI input (`crony start foo`) is shorthand for
@@ -113,7 +121,7 @@ holding persistent locks in global uv cache path.
 ### `config init [--force] [-b BUNDLE]`
 
 Generate a default config file. With --bundle, write config/\<bundle>.toml
-instead of config.toml.
+instead of config/default.toml. An existing compatibility config is reused.
 
 - **`--force`**\
   Overwrite an existing config file.
@@ -128,8 +136,8 @@ a CI gate. Reports only config faults, never installed remnants -- use
 
 - **`--file PATH`**\
   Structurally validate a single TOML file as a bundle (named after its stem,
-  or 'default' for the installed config.toml), independent of the config dir.
-  Exits non-zero on any error. Lets a tool pre-flight a bundle.
+  or 'default' for the installed default config), independent of the config
+  dir. Exits non-zero on any error. Lets a tool pre-flight a bundle.
 
 ### `config update [-b BUNDLE]`
 
