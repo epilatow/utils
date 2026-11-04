@@ -386,7 +386,7 @@ Five minutes of continuous runtime resets the retry budget.\&
 If its execution gate fails it stays stopped without consuming retries.\&
 .TP
 \f[I]disabled\f[R]
-A job that has been disabled via the \(gadisable\(ga subcommand; it will not be run via any schedule.\&
+A job disabled on first apply or via the \(gadisable\(ga subcommand; it will not be run via any schedule.\&
 It can be run manually via the \(gastart\(ga subcommand, and re\-enabled via the \(gaenable\(ga subcommand.\&
 .SS STATUS values
 .TP
@@ -460,6 +460,12 @@ Execute the job with TCC Full Disk Access permissions and allow cloud\-only file
 \f[I]daemon\f[R]
 Run continuously with automatic restarts.\&
 Jobs only; cannot be inherited from defaults or groups, or combined with a schedule, interval, or on\-demand mode.\&
+.TP
+\f[I]disabled\f[R]
+Start disabled on first apply.\&
+Can be inherited from defaults and groups.\&
+Later applies preserve the applied enabled/disabled state; use \(gaenable\(ga or \(gadisable\(ga to change it.\&
+A new UUID or destroy followed by apply uses this initial setting again.\&
 .SS MASKED values
 .TP
 \f[I]host\f[R]

@@ -533,6 +533,50 @@ class TestApplyLifecycle:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
+    @pytest.mark.parametrize("daemon", [False, True])
+    def test_initial_disabled_survives_enable_and_reapply(
+        self, e2e: _CronyE2E, daemon: bool
+    ) -> None:
+        e2e.use_isolated_launcher()
+        timing = "daemon = true" if daemon else 'schedule = "*-*-* 03:00"'
+        command = "sleep 300" if daemon else "true"
+        e2e.write_bundle(
+            f'[job.probe]\ncommand = "{command}"\n{timing}\ndisabled = true\n',
+            ["probe"],
+        )
+        full = e2e.full("probe")
+        e2e.crony("apply", full)
+        assert e2e.status_cells(full, "config", "schedule") == [
+            "synced",
+            "disabled",
+        ]
+        assert not e2e.unit_running("probe")
+        e2e.crony("enable", full)
+        e2e.crony("apply", full)
+        assert e2e.status_config(full) == "synced"
+        assert e2e.status_cells(full, "schedule") != ["disabled"]
+        if daemon:
+            e2e.wait_until(
+                lambda: e2e.unit_running("probe"),
+                timeout=60,
+                what="the enabled daemon to start",
+            )
+        else:
+            e2e.crony("disable", full)
+            e2e.crony("start", full)
+            e2e.wait_for_recorded_status(full, "ok")
+            assert e2e.status_cells(full, "schedule", "status") == [
+                "disabled",
+                "ok",
+            ]
+        e2e.crony("destroy", full)
+        e2e.crony("apply", full)
+        assert e2e.status_cells(full, "config", "schedule") == [
+            "synced",
+            "disabled",
+        ]
+        assert not e2e.unit_running("probe")
+
     def test_job_env_expansion_excludes_launcher_path(
         self,
         e2e: _CronyE2E,
@@ -1118,6 +1162,7 @@ class TestDaemonSupervision:
             what="the started daemon to start",
         )
         started = self._start_marker(e2e)
+        e2e.wait_for_recorded_status(e2e.full("d"), "ok")
         # Several restart intervals: it must not start again.
         time.sleep(8)
         assert self._start_marker(e2e) == started, (

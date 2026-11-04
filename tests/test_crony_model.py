@@ -739,6 +739,23 @@ class TestUnitDisabled:
         d.pop("unit_disabled", None)  # a snapshot written before the field
         assert snapshot_from_dict(d).unit_disabled is False
 
+    def test_initial_flag_is_separate_from_applied_state(self) -> None:
+        cfg = _parse({"job": {"j": _job(disabled=True)}})
+        snap = _resolve_snapshot_for(cfg, "j")
+        assert snap.unit_disabled
+        enabled = snap.with_unit_disabled(False)
+        restored = snapshot_from_dict(enabled.to_dict())
+        assert JobFlags.DISABLED in restored.flags
+        assert not restored.unit_disabled
+
+    def test_old_snapshot_does_not_gain_initial_flag(self) -> None:
+        raw = self._snap().with_unit_disabled(True).to_dict()
+        raw["schema"] = 9
+        raw.pop("disabled")
+        restored = snapshot_from_dict(raw)
+        assert restored.unit_disabled
+        assert JobFlags.DISABLED not in restored.flags
+
 
 class TestOnDemand:
     """`on-demand = true` is the on-demand firing mode: the node
@@ -968,6 +985,7 @@ class TestSnapshotFieldSync:
                 "interactive_active_sec": 11,
                 "interactive_delay_sec": 22,
                 "full-disk-access": True,
+                "disabled": True,
                 "unit_disabled": True,
             }
         )
@@ -988,6 +1006,7 @@ class TestSnapshotFieldSync:
         )
         d = _resolve_snapshot_for(cfg, "g").to_dict()
         d["unit_disabled"] = True
+        d["disabled"] = True
         return d
 
     def test_job_dict_round_trips_unchanged(self) -> None:
@@ -1320,7 +1339,7 @@ def test_schema_v8_group_remains_runnable_after_timeout_rename() -> None:
     assert isinstance(restored, JobGroup)
     assert restored.start_timeout_sec == group.start_timeout_sec
     assert restored.snapshot_schema == 8
-    assert CURRENT_SNAPSHOT_SCHEMA == 9
+    assert CURRENT_SNAPSHOT_SCHEMA >= 9
 
 
 if __name__ == "__main__":

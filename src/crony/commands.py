@@ -72,7 +72,7 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     `on-demand` and a continuous Daemon one as `daemon`. An entry with no
     timing -- a transit group or a group-only job -- displays as
     `grouped`. This renders only the schedule shape; the caller overrides
-    the cell with `disabled` for an operator-disabled entry (it has the
+    the cell with `disabled` for a disabled entry (it has the
     snapshot's disable flag).
     """
     if isinstance(timing, crony.unit.Schedule):
@@ -181,7 +181,7 @@ def _stale_fields(
 # =============================================================================
 # RUNTIME STATE (enable / disable / status)
 # =============================================================================
-# Runtime state is the operator-disable overlay crony records on the
+# Runtime state includes the disable overlay crony records on the
 # snapshot. It's orthogonal to CONFIG state: a unit can be `synced` with
 # config while the operator has paused it (`disabled`, surfaced in
 # status' SCHEDULE cell). apply preserves the disable across re-renders
@@ -2323,8 +2323,7 @@ def _node_flags(
 
     Both jobs and groups carry a resolved flags bitmask. A group's is
     its cascade value -- shown so the inheritance it hands down to its
-    children is visible, even though group flags have no runtime effect
-    on the group itself.
+    children is visible.
     """
     return node.flags if node is not None else None
 
@@ -2650,11 +2649,8 @@ def do_status(
             config, config_name, remnants, mask_reason=mask_reason
         )
         last_ran = _last_ran_at(config, config_name)
-        # The operator-disable rides on the applied snapshot, so it reads
-        # off the current node (a disable always follows an apply). The
-        # override below keys off this in every --config-* view -- the
-        # pending side, which load mirrors to the same value, shows
-        # `disabled` too rather than the schedule it would compare to.
+        # Disable state is applied state, so every --config-* view uses
+        # the current snapshot's value.
         disabled = current_node is not None and current_node.unit_disabled
 
         # SCHEDULE / GROUPS / name are dual-source: read each side by

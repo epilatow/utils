@@ -333,7 +333,7 @@ class Daemon:
     dormant ones (OnDemand / no timing) because its unit starts itself
     and is kept running. It arms no timer, so ``is_scheduled`` is False
     for it; a backend asks ``is_daemon`` -- or, once the entry may be
-    operator-disabled, ``UnitSpec.daemon`` -- to tell it from an entry
+    disabled, ``UnitSpec.daemon`` -- to tell it from an entry
     that merely sits dormant.
     """
 

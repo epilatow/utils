@@ -3326,6 +3326,7 @@ class TestJobFlags:
             JobFlags.KEEP_AWAKE,
             JobFlags.FULL_DISK_ACCESS,
             JobFlags.DAEMON,
+            JobFlags.DISABLED,
         ]
 
 

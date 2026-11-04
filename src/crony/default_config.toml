@@ -49,6 +49,10 @@
 # above, and "flag=false" turns one off. Settable at [defaults],
 # [job-group.*], and [job.*]; a group or job overrides with its own.
 # The daemon flag is job-only (see codex-remote-control below).
+# `disabled = true` (or `flags = ["disabled"]`) starts an entry disabled
+# on first apply; it can still be run with `crony start`. It cascades
+# like other flags; a child can override it with `disabled = false`.
+# See `crony status --help` FLAG values for its lifecycle semantics.
 #
 #[defaults.env]
 #PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins

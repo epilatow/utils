@@ -335,17 +335,16 @@ class _JobCommon:
     flags: crony.config.JobFlags = field(
         default=crony.config.JobFlags(0), kw_only=True
     )
-    # Whether the operator turned this scheduled entry off (`crony
-    # disable`). The schedule stays pinned in `timing` (so `enable`
+    # Whether this entry is disabled, initially by config or via `crony
+    # disable`. The schedule stays pinned in `timing` (so `enable`
     # restores it), but a disabled entry renders its unit with no
     # schedule (`unit_spec` drops the timing) -- loaded and startable,
     # just not firing on its own. For a daemon, whose only mode of
     # firing is its own, that means an inert unit: stopped, and started
     # by neither boot nor a restart. Persisted in snapshot.json (it is real
-    # applied state, not derived), and defaulted False so config-built
-    # nodes start enabled (config has no disabled notion). `load_config`
-    # mirrors a disabled current node's flag onto its pending node so the
-    # operator overlay reads `synced`, not stale. Keyword-only.
+    # applied state, not derived). Config-built nodes seed it from the
+    # DISABLED flag; `load_config` mirrors the current node's state onto
+    # its pending node so operator choices read `synced`. Keyword-only.
     unit_disabled: bool = field(default=False, kw_only=True)
     # The uv / crony executable paths this entry's unit runs, baked onto
     # the node so unit rendering is self-contained -- `unit_spec` reads
@@ -752,12 +751,13 @@ class Job(_JobCommon):
         priority = config.resolved_priority(job)
         timeout = config.resolved_job_timeout_sec(job)
         interactive = crony.config.JobFlags.INTERACTIVE in flags
+        disabled = crony.config.JobFlags.DISABLED in flags
         platform_properties = _unit_platform_properties(platform)
         rendered_units = _pending_rendered_units(
             platform_properties,
             name,
             crony.unit.EntityRef(name.bundle, job.uuid),
-            job.timing,
+            None if disabled else job.timing,
             priority,
             timeout,
             interactive,
@@ -783,6 +783,7 @@ class Job(_JobCommon):
             timing=job.timing,
             priority=priority,
             flags=flags,
+            unit_disabled=disabled,
             platform_properties=platform_properties,
             uv_path=uv_path,
             crony_path=crony_path,
@@ -811,6 +812,7 @@ class Job(_JobCommon):
             interval=self._interval_str(),
             on_demand=self._on_demand(),
             daemon=crony.config.JobFlags.DAEMON in self.flags,
+            disabled=crony.config.JobFlags.DISABLED in self.flags,
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -955,10 +957,10 @@ class JobGroup(_JobCommon):
         `flags` is the group's resolved cascade value (the defaults
         composed with its ancestor groups and its own delta), supplied
         by the caller; when omitted it defaults to the defaults composed
-        with the group's own delta. A group's flags have no runtime
-        effect -- the runner acts only on a job's flags -- but the
-        resolved value is persisted and shown so the inheritance the
-        group hands down to its children stays visible.
+        with the group's own delta. DISABLED seeds the group's initial
+        applied state; the other flags affect jobs only. The resolved
+        value is persisted and shown so the inheritance the group hands
+        down to its children stays visible.
 
         Children that aren't selected on this host are dropped from
         `children`. That covers both own-filter masks (the child's
@@ -986,13 +988,14 @@ class JobGroup(_JobCommon):
             children.append(crony.unit.EntityRef(name.bundle, child_uuid))
         if flags is None:
             flags = config.composed_flags(group.flags, group.timing)
+        disabled = crony.config.JobFlags.DISABLED in flags
         timeout = config.resolved_group_timeout_sec(target, group.name)
         platform_properties = _unit_platform_properties(platform)
         rendered_units = _pending_rendered_units(
             platform_properties,
             name,
             crony.unit.EntityRef(name.bundle, group.uuid),
-            group.timing,
+            None if disabled else group.timing,
             crony.unit.PriorityClass.NORMAL,
             timeout,
             False,
@@ -1010,6 +1013,7 @@ class JobGroup(_JobCommon):
             start_timeout_sec=config.defaults.start_timeout_sec,
             timing=group.timing,
             flags=flags,
+            unit_disabled=disabled,
             platform_properties=platform_properties,
             uv_path=uv_path,
             crony_path=crony_path,
@@ -1027,6 +1031,7 @@ class JobGroup(_JobCommon):
             interval=self._interval_str(),
             on_demand=self._on_demand(),
             daemon=crony.config.JobFlags.DAEMON in self.flags,
+            disabled=crony.config.JobFlags.DISABLED in self.flags,
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -1656,7 +1661,7 @@ class ScheduleValue(_DescribedStrEnum):
     DISABLED = (
         "disabled",
         (
-            "A job that has been disabled via the `disable` subcommand; it "
+            "A job disabled on first apply or via the `disable` subcommand; it "
             "will not be run via any schedule. It can be run manually via the "
             "`start` subcommand, and re-enabled via the `enable` "
             "subcommand."

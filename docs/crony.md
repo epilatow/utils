@@ -397,9 +397,9 @@ Send a synthetic failure notification.
   runtime resets the retry budget. If its execution gate fails it stays
   stopped without consuming retries.
 - **`disabled`**\
-  A job that has been disabled via the `disable` subcommand; it will not be
-  run via any schedule. It can be run manually via the `start` subcommand, and
-  re-enabled via the `enable` subcommand.
+  A job disabled on first apply or via the `disable` subcommand; it will not
+  be run via any schedule. It can be run manually via the `start` subcommand,
+  and re-enabled via the `enable` subcommand.
 
 ### STATUS values
 
@@ -469,6 +469,11 @@ Send a synthetic failure notification.
   Run continuously with automatic restarts. Jobs only; cannot be inherited
   from defaults or groups, or combined with a schedule, interval, or on-demand
   mode.
+- **`disabled`**\
+  Start disabled on first apply. Can be inherited from defaults and groups.
+  Later applies preserve the applied enabled/disabled state; use `enable` or
+  `disable` to change it. A new UUID or destroy followed by apply uses this
+  initial setting again.
 
 ### MASKED values
 

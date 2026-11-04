@@ -2466,6 +2466,162 @@ class TestUvExecutable:
 
 
 class TestEnableDisable:
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    @pytest.mark.parametrize(
+        "mode", ["schedule", "interval", "on-demand", "daemon"]
+    )
+    @pytest.mark.parametrize(
+        "setting", [{"disabled": True}, {"flags": ["disabled"]}]
+    )
+    def test_initial_disabled_lifecycle(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        platform: str,
+        mode: str,
+        setting: dict[str, Any],
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        timings: dict[str, str | bool] = {
+            "schedule": "*-*-* 03:00",
+            "interval": "1h",
+            "on-demand": True,
+            "daemon": True,
+        }
+        timing = timings[mode]
+        h.config(
+            {"job": {"j": {"command": "true", mode: timing, **setting}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled
+        assert JobFlags.DISABLED in node.flags
+        assert node.unit_spec().timing is None
+        assert config.cfg_status(ref) == "synced"
+        if platform == "darwin":
+            plist = plistlib.loads(
+                (h.agents / f"org.crony.{h.full('j')}.plist").read_bytes()
+            )
+            assert "StartCalendarInterval" not in plist
+            assert "StartInterval" not in plist
+            assert plist.get("RunAtLoad") is False
+            assert plist.get("KeepAlive") is False
+        else:
+            assert not (h.sysd / f"crony-{h.full('j')}.timer").exists()
+            service = (h.sysd / f"crony-{h.full('j')}.service").read_text()
+            assert "[Install]" not in service
+            assert "Restart=on-failure" not in service
+
+        crony_commands.do_enable(jobs=["j"], bundle=None, sync=False)
+        h.apply("j")
+        config = crony_runtime.load_config()
+        node = config.current.job_from_ref(ref)
+        assert node is not None and not node.unit_disabled
+        assert JobFlags.DISABLED in node.flags
+        assert node.unit_spec().timing == node.timing
+        assert config.cfg_status(ref) == "synced"
+
+        crony_commands.do_disable(jobs=["j"], bundle=None)
+        h.config(
+            {"job": {"j": {"command": "changed", mode: timing}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        config = crony_runtime.load_config()
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled
+        assert JobFlags.DISABLED not in node.flags
+        assert config.cfg_status(ref) == "synced"
+
+    @pytest.mark.parametrize("recreate", ["uuid", "destroy"])
+    def test_new_identity_uses_initial_setting_again(
+        self, tmp_path: Path, monkeypatch: Any, recreate: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        body: dict[str, Any] = {
+            "command": "true",
+            "schedule": "daily",
+            "disabled": True,
+        }
+        h.config({"job": {"j": body}}, default_target_jobs=["j"])
+        h.apply("j")
+        crony_commands.do_enable(jobs=["j"], bundle=None, sync=False)
+        if recreate == "uuid":
+            body["uuid"] = "abcdabcd-1111-2222-3333-444455556666"
+            h.config({"job": {"j": body}}, default_target_jobs=["j"])
+        else:
+            crony_commands.do_destroy(jobs=["j"], bundle=None, orphans=False)
+        h.apply("j")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled
+
+    def test_adding_initial_flag_does_not_disable_existing_job(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "changed",
+                        "schedule": "daily",
+                        "disabled": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and not node.unit_disabled
+        assert JobFlags.DISABLED in node.flags
+        assert config.cfg_status(ref) == "synced"
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_initial_disabled_cascade_and_group_enable(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        h.config(
+            {
+                "defaults": {"disabled": True},
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true", "disabled": False},
+                },
+                "job-group": {"g": {"jobs": ["a", "b"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony_commands.do_apply(
+            jobs=["g"], verbose=False, bundle=None, sync=False
+        )
+        config = crony_runtime.load_config()
+        for name, disabled in (("g", True), ("a", True), ("b", False)):
+            ref = config.current.by_full_name[h.full(name)]
+            node = config.current.job_from_ref(ref)
+            assert node is not None and node.unit_disabled == disabled
+            assert config.cfg_status(ref) == "synced"
+        crony_commands.do_enable(jobs=["g"], bundle=None, sync=False)
+        h.apply("g")
+        config = crony_runtime.load_config()
+        group = config.current.job_from_ref(
+            config.current.by_full_name[h.full("g")]
+        )
+        assert group is not None and not group.unit_disabled
+
     def test_enable_restores_timer_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

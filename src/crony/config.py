@@ -66,6 +66,7 @@ class JobFlags(enum.Flag):
     KEEP_AWAKE = enum.auto()
     FULL_DISK_ACCESS = enum.auto()
     DAEMON = enum.auto()
+    DISABLED = enum.auto()
 
     @property
     def token(self) -> JobFlagNames:
@@ -125,6 +126,7 @@ class JobFlagNames(enum.StrEnum):
     KEEP_AWAKE = "keep-awake"
     FULL_DISK_ACCESS = "full-disk-access"
     DAEMON = "daemon"
+    DISABLED = "disabled"
 
 
 assert {n.name for n in JobFlagNames} == {f.name for f in JobFlags.members()}, (
@@ -161,6 +163,12 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
         "Run continuously with automatic restarts. Jobs only; cannot be "
         "inherited from defaults or groups, or combined with a schedule, "
         "interval, or on-demand mode."
+    ),
+    JobFlags.DISABLED: (
+        "Start disabled on first apply. Can be inherited from defaults "
+        "and groups. Later applies preserve the applied enabled/disabled "
+        "state; use `enable` or `disable` to change it. A new UUID or "
+        "destroy followed by apply uses this initial setting again."
     ),
 }
 
@@ -605,9 +613,8 @@ class TomlJobGroup:
     platforms: list[str] = field(default_factory=list)
     hosts: _HostList = field(default_factory=_HostList)
     # The capability flags this group explicitly sets (true / false),
-    # parsed from `flags = [...]`. A group has no per-flag behavior of
-    # its own; the delta exists for the flag cascade to compose into its
-    # children.
+    # parsed from `flags = [...]` or scalar keys. The delta cascades to
+    # children, and DISABLED also seeds the group's own applied state.
     flags: dict[JobFlags, bool] = field(default_factory=dict)
 
 

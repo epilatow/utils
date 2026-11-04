@@ -523,18 +523,17 @@ def load_config() -> crony.model.Config:
         crony.paths.STATE_DIR, last_exits, platform
     )
 
-    # `disabled` is a runtime overlay the config has no notion of, so a
-    # disabled current entry's pending node would otherwise render with a
-    # schedule and read stale. Mirror the flag onto the matching pending
-    # node and re-render its normalized units so the overlay reads synced
-    # and a re-apply preserves the disable.
+    # Existing entries keep their applied state even when config's
+    # initial DISABLED flag differs. Mirror both enabled and disabled
+    # choices so a re-apply preserves the operator's decision.
     for node in current.nodes():
-        if not node.unit_disabled:
-            continue
         pending_node = pending.job_from_ref(node.entity_ref)
-        if pending_node is not None:
+        if (
+            pending_node is not None
+            and pending_node.unit_disabled != node.unit_disabled
+        ):
             pending.replace_node(
-                pending_node.with_unit_disabled(True, platform)
+                pending_node.with_unit_disabled(node.unit_disabled, platform)
             )
 
     # Resolve same-name collisions among current entries. Two state
@@ -1525,12 +1524,9 @@ def apply_one(
     ):
         sched.deactivate(full_name)
 
-    # The operator-disabled state is preserved across a re-apply by
-    # `load_config`, which mirrors a disabled current entry's flag onto
-    # the pending node -- so `snapshot.unit_disabled` is already correct
-    # here, and a fresh install (no current node) lands enabled. A uuid
-    # change clears it: `do_apply` reclaimed the old unit first, so the
-    # new job installs fresh. `activate` is skipped for a self-reload
+    # `load_config` preserves an existing entry's enabled/disabled state;
+    # a fresh identity uses the config's initial DISABLED flag.
+    # `activate` is skipped for a self-reload
     # that fell through here: the unit didn't change (a change would have
     # deferred above), so reloading would only terminate this very run
     # for no benefit.
@@ -1598,7 +1594,7 @@ def set_disabled(
     *,
     disabled: bool,
 ) -> bool:
-    """Flip one applied entry's operator-disabled state and update its units.
+    """Flip one applied entry's disabled state and update its units.
 
     Disabling a daemon publishes its new snapshot before the unit reload
     stops its runner, restoring the prior snapshot if installation fails.

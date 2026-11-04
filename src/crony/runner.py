@@ -1329,11 +1329,11 @@ def _child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
 
 
 def _child_is_disabled(child_ref: crony.unit.EntityRef) -> bool:
-    """True iff the child's pinned snapshot is operator-disabled
-    (`crony disable`). The parent group skips a disabled child instead
-    of dispatching it. A missing snapshot returns False so the absent
-    child still flows to the synthetic-FAIL / UnitNotInstalledError path
-    that surfaces the missing unit.
+    """True iff the child's pinned snapshot is disabled.
+
+    The parent group skips a disabled child instead of dispatching it.
+    A missing snapshot returns False so an absent child still reaches the
+    synthetic-FAIL / UnitNotInstalledError path that surfaces the missing unit.
     """
     try:
         cs = crony.runtime.load_snapshot(child_ref)
@@ -1460,7 +1460,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
 
                         child_sd = crony.model.Job.state_dir_from_ref(child_ref)
                         if _child_is_disabled(child_ref):
-                            # An operator-disabled child is intentionally not
+                            # A disabled child is intentionally not
                             # run: skipping it is the group doing as it was
                             # told, not a failure to run it, so record it
                             # `gated` and move on without faulting the group.

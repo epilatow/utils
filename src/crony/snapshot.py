@@ -87,6 +87,7 @@ class _SnapshotCommon(_SnapshotModel):
     # timing at all) from an ordinary dormant entry.
     daemon: Annotated[bool, _Since(8)] = False
     unit_disabled: Annotated[bool, _Since(6)] = False
+    disabled: Annotated[bool, _Since(10)] = False
     # One boolean per JobFlags member, keyed on disk by the flag's dash
     # token. A drift test asserts these stay in lockstep with
     # JobFlags.members().
@@ -135,6 +136,8 @@ class _SnapshotCommon(_SnapshotModel):
             flags |= crony.config.JobFlags.FULL_DISK_ACCESS
         if self.daemon:
             flags |= crony.config.JobFlags.DAEMON
+        if self.disabled:
+            flags |= crony.config.JobFlags.DISABLED
         return flags
 
 
