@@ -2994,8 +2994,26 @@ class TestJobFlagsField:
     def test_every_flag_has_a_scalar_key(self, flag: JobFlags) -> None:
         # The scalar surface is derived from JobFlags.members(), so each
         # member is accepted as a bare boolean key spelled by its token.
-        cfg = _parse(self._cfg(_job(**{flag.token: True})))
+        cfg = _parse(self._cfg(_grouped_job(**{flag.token: True})))
         assert cfg.jobs["j"].flags == {flag: True}
+
+    @pytest.mark.parametrize("flag", list(JobFlags.members()))
+    def test_every_flag_has_a_list_spelling(self, flag: JobFlags) -> None:
+        cfg = _parse(self._cfg(_grouped_job(flags=[flag.token])))
+        assert cfg.jobs["j"].flags == {flag: True}
+
+    @pytest.mark.parametrize("flag", list(JobFlags.members()))
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_every_flag_set_both_ways_rejected(
+        self, flag: JobFlags, enabled: bool
+    ) -> None:
+        _assert_errored_job(
+            self._cfg(
+                _grouped_job(flags=[flag.token], **{flag.token: enabled})
+            ),
+            "j",
+            "use one",
+        )
 
     def test_scalar_and_flag_for_different_flags_ok(self) -> None:
         cfg = _parse(self._cfg(_job(interactive=True, flags=["keep-awake"])))
@@ -3307,6 +3325,7 @@ class TestJobFlags:
             JobFlags.INTERACTIVE,
             JobFlags.KEEP_AWAKE,
             JobFlags.FULL_DISK_ACCESS,
+            JobFlags.DAEMON,
         ]
 
 
@@ -3339,19 +3358,45 @@ class TestPolicyFloors:
 
 
 class TestParseDaemon:
-    """`daemon = true` is a firing mode of its own, mutually exclusive
+    """The daemon flag selects a firing mode of its own, mutually exclusive
     with the others, and rejects the keys that make no sense for a
     process meant to stay up."""
 
     def _daemon(self, **overrides: Any) -> dict[str, Any]:
-        body: dict[str, Any] = {"command": "serve", "daemon": True}
-        body.pop("schedule", None)
+        body: dict[str, Any] = {"command": "serve", "flags": ["daemon"]}
         body.update(overrides)
         return body
 
     def test_parses_to_daemon_timing(self) -> None:
         cfg = _parse({"job": {"d": self._daemon()}})
         assert isinstance(cfg.jobs["d"].timing, Daemon)
+        assert cfg.jobs["d"].flags == {JobFlags.DAEMON: True}
+
+    @pytest.mark.parametrize(
+        "setting",
+        [{"daemon": True}, {"flags": ["daemon=true"]}, {"flags": ["DAEMON"]}],
+    )
+    def test_enabled_spellings(self, setting: dict[str, Any]) -> None:
+        cfg = _parse({"job": {"d": _grouped_job(**setting)}})
+        assert isinstance(cfg.jobs["d"].timing, Daemon)
+        assert cfg.jobs["d"].flags == {JobFlags.DAEMON: True}
+
+    @pytest.mark.parametrize(
+        "setting", [{"daemon": False}, {"flags": ["daemon=false"]}]
+    )
+    def test_disabled_flag_preserves_schedule(
+        self, setting: dict[str, Any]
+    ) -> None:
+        cfg = _parse({"job": {"d": _job(**setting)}})
+        assert isinstance(cfg.jobs["d"].timing, Schedule)
+        assert cfg.jobs["d"].flags == {JobFlags.DAEMON: False}
+
+    @pytest.mark.parametrize(
+        "setting", [{"daemon": True}, {"flags": ["daemon"]}]
+    )
+    def test_rejected_in_defaults(self, setting: dict[str, Any]) -> None:
+        with pytest.raises(ConfigError, match="applies to a job"):
+            _parse({"defaults": setting})
 
     @pytest.mark.parametrize(
         "other",
@@ -3366,11 +3411,14 @@ class TestParseDaemon:
             "mutually exclusive",
         )
 
-    def test_rejected_on_a_group(self) -> None:
+    @pytest.mark.parametrize(
+        "setting", [{"daemon": True}, {"flags": ["daemon"]}]
+    )
+    def test_rejected_on_a_group(self, setting: dict[str, Any]) -> None:
         cfg = _parse(
             {
                 "job": {"a": _grouped_job()},
-                "job-group": {"g": {"jobs": ["a"], "daemon": True}},
+                "job-group": {"g": {"jobs": ["a"], **setting}},
             }
         )
         assert "g" in cfg.errored_job_groups

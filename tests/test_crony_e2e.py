@@ -898,7 +898,9 @@ class TestDaemonSupervision:
     def _apply_daemon(self, e2e: _CronyE2E) -> None:
         # Short backoff so a respawn lands inside the poll window.
         e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
-        e2e.write_bundle('[job.d]\ncommand = "true"\ndaemon = true\n', ["d"])
+        e2e.write_bundle(
+            '[job.d]\ncommand = "true"\nflags = ["daemon"]\n', ["d"]
+        )
         e2e.crony("apply", e2e.full("d"))
 
     def _start_marker(self, e2e: _CronyE2E) -> str:

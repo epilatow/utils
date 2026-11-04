@@ -456,6 +456,10 @@ an unprivileged Linux user denied the polkit action) runs the job without it rat
 \f[I]full\-disk\-access\f[R]
 macOS/Darwin only.\&
 Execute the job with TCC Full Disk Access permissions and allow cloud\-only file contents to download on access.\&
+.TP
+\f[I]daemon\f[R]
+Run continuously with automatic restarts.\&
+Jobs only; cannot be inherited from defaults or groups, or combined with a schedule, interval, or on\-demand mode.\&
 .SS MASKED values
 .TP
 \f[I]host\f[R]

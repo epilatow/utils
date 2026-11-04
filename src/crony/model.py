@@ -598,13 +598,6 @@ class _JobCommon:
         or from a schedule reads as drift)."""
         return isinstance(self.timing, crony.unit.OnDemand)
 
-    def _daemon(self) -> bool:
-        """Whether this entry's timing is the continuous Daemon mode
-        (persisted for the same reasons as `_on_demand`, and so a
-        disabled daemon -- which renders with no timing -- is still
-        recognizable as one)."""
-        return crony.unit.is_daemon(self.timing)
-
     def _to_snapshot(
         self,
     ) -> crony.snapshot.JobSnapshot | crony.snapshot.GroupSnapshot:
@@ -817,7 +810,7 @@ class Job(_JobCommon):
             schedule=self._schedule_str(),
             interval=self._interval_str(),
             on_demand=self._on_demand(),
-            daemon=self._daemon(),
+            daemon=crony.config.JobFlags.DAEMON in self.flags,
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -1033,7 +1026,7 @@ class JobGroup(_JobCommon):
             schedule=self._schedule_str(),
             interval=self._interval_str(),
             on_demand=self._on_demand(),
-            daemon=self._daemon(),
+            daemon=crony.config.JobFlags.DAEMON in self.flags,
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,

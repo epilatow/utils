@@ -317,15 +317,14 @@ class OnDemand:
 
 
 # The canonical display token for the continuous firing mode (see
-# Daemon) -- what `str(Daemon())` and the status SCHEDULE cell show. The
-# config spells the mode as the `daemon = true` key, not this string.
+# Daemon) -- what `str(Daemon())` and the status SCHEDULE cell show.
 DAEMON_SPEC = "daemon"
 
 
 @dataclass(frozen=True)
 class Daemon:
-    """The continuous firing mode: an entry that declares
-    ``daemon = true`` and runs for as long as it can. The platform
+    """The continuous firing mode: a job with the daemon flag enabled
+    that runs for as long as it can. The platform
     supervisor restarts it when the runner requests one; the runner
     bounds that retry policy consistently across platforms.
 

@@ -48,6 +48,7 @@
 # `flags = ["keep-awake"]` is the same as the scalar `keep-awake`
 # above, and "flag=false" turns one off. Settable at [defaults],
 # [job-group.*], and [job.*]; a group or job overrides with its own.
+# The daemon flag is job-only (see codex-remote-control below).
 #
 #[defaults.env]
 #PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
@@ -237,13 +238,15 @@
 # to stay up. After the sixth exit it reports `fail` and stays loaded but
 # stopped until the next login, `crony start`, `crony apply`, or `crony
 # enable` starts a fresh retry budget. Running continuously for five
-# minutes also resets the budget before a later exit. `daemon = true` is
-# mutually exclusive with `schedule` / `interval` / `on-demand`, and
-# shows `daemon` in `crony status`.
+# minutes also resets the budget before a later exit. The `daemon` flag
+# (`flags = ["daemon"]` or `daemon = true`) is mutually exclusive with
+# `schedule` / `interval` / `on-demand`, and shows `daemon` in
+# `crony status`.
 # `crony stop` stops the currently running instance. An enabled daemon is
 # automatically restarted. If the instance ran for less than the restart
 # delay, crony waits for the rest of that delay before restarting it.
 # A disabled daemon stays stopped.
+# The flag is job-only: it cannot be enabled in [defaults] or on a group.
 #
 # The gate runs before every start, so it doubles as a precondition: a
 # daemon whose gate fails stays stopped immediately rather than consuming
@@ -262,7 +265,7 @@
 #[job.codex-remote-control]
 #command = "codex remote-control"
 #gate    = "command -v codex"
-#daemon  = true
+#flags   = ["daemon"]
 
 # Interactive job: sits pending after its fire and pops a
 # desktop dialog (Run / Delay / Cancel) once the user has been

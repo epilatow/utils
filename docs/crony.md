@@ -465,6 +465,10 @@ Send a synthetic failure notification.
 - **`full-disk-access`**\
   macOS/Darwin only. Execute the job with TCC Full Disk Access permissions and
   allow cloud-only file contents to download on access.
+- **`daemon`**\
+  Run continuously with automatic restarts. Jobs only; cannot be inherited
+  from defaults or groups, or combined with a schedule, interval, or on-demand
+  mode.
 
 ### MASKED values
 

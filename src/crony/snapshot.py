@@ -133,6 +133,8 @@ class _SnapshotCommon(_SnapshotModel):
             flags |= crony.config.JobFlags.KEEP_AWAKE
         if self.full_disk_access:
             flags |= crony.config.JobFlags.FULL_DISK_ACCESS
+        if self.daemon:
+            flags |= crony.config.JobFlags.DAEMON
         return flags
 
 

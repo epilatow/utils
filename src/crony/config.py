@@ -65,6 +65,7 @@ class JobFlags(enum.Flag):
     INTERACTIVE = enum.auto()
     KEEP_AWAKE = enum.auto()
     FULL_DISK_ACCESS = enum.auto()
+    DAEMON = enum.auto()
 
     @property
     def token(self) -> JobFlagNames:
@@ -123,6 +124,7 @@ class JobFlagNames(enum.StrEnum):
     INTERACTIVE = "interactive"
     KEEP_AWAKE = "keep-awake"
     FULL_DISK_ACCESS = "full-disk-access"
+    DAEMON = "daemon"
 
 
 assert {n.name for n in JobFlagNames} == {f.name for f in JobFlags.members()}, (
@@ -154,6 +156,11 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
         "macOS/Darwin only. Execute the job with TCC Full Disk Access "
         "permissions and allow cloud-only file contents to download on "
         "access."
+    ),
+    JobFlags.DAEMON: (
+        "Run continuously with automatic restarts. Jobs only; cannot be "
+        "inherited from defaults or groups, or combined with a schedule, "
+        "interval, or on-demand mode."
     ),
 }
 
@@ -1445,10 +1452,10 @@ def _parse_timing(
     where: str,
 ) -> crony.unit.Timing | None:
     """Build a unit's firing mode from the config's mutually-exclusive
-    `schedule` / `interval` / `on-demand` / `daemon` keys, or None when
-    none is set (a transit group or group-only job). `on-demand = true`
-    selects the on-demand mode (`crony.unit.OnDemand`) and
-    `daemon = true` the continuous one (`crony.unit.Daemon`). Surfaces
+    `schedule` / `interval` / `on-demand` keys and the daemon flag, or
+    None when none is set (a transit group or group-only job).
+    `on-demand = true` selects the on-demand mode (`crony.unit.OnDemand`)
+    and the daemon flag the continuous one (`crony.unit.Daemon`). Surfaces
     the value objects' validation as a config error tied to `where`.
     Intervals below `_min_interval_seconds` are rejected."""
     present = [
@@ -1554,7 +1561,6 @@ _KNOWN_JOB: frozenset[str] = (
             "schedule",
             "interval",
             "on-demand",
-            "daemon",
             "priority",
             "platforms",
             "hosts",
@@ -1579,7 +1585,6 @@ _KNOWN_JOB_GROUP: frozenset[str] = (
             "schedule",
             "interval",
             "on-demand",
-            "daemon",
             "platforms",
             "hosts",
             "flags",
@@ -2267,6 +2272,11 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
             sub_key, sub_body
         )
     flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
+    if flags.get(JobFlags.DAEMON):
+        raise crony.errors.ConfigError(
+            f"{where}: 'daemon' applies to a job, not defaults; "
+            f"set it on each daemon job"
+        )
     return Defaults(
         notify_channels=channels or [],
         notify_attach_log=_typed_field(
@@ -2405,10 +2415,10 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
     on_demand = _typed_field(raw, "on-demand", bool, where, default=False)
-    daemon = _typed_field(raw, "daemon", bool, where, default=False)
+    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
+    daemon = flags.get(JobFlags.DAEMON, False)
     timing = _parse_timing(schedule_str, interval_str, on_demand, daemon, where)
     priority = _parse_priority_field(raw, where)
-    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     keep_awake = flags.get(JobFlags.KEEP_AWAKE)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
@@ -2484,7 +2494,8 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
     on_demand = _typed_field(raw, "on-demand", bool, where, default=False)
-    if _typed_field(raw, "daemon", bool, where, default=False):
+    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
+    if flags.get(JobFlags.DAEMON):
         raise crony.errors.ConfigError(
             f"{where}: 'daemon' applies to a job, not a job group -- a "
             f"group sequences its children and returns, so it has no "
@@ -2493,7 +2504,6 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     timing = _parse_timing(schedule_str, interval_str, on_demand, False, where)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
-    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     return TomlJobGroup(
         name=name,
         uuid=group_uuid,

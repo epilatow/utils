@@ -7573,6 +7573,22 @@ class TestStatusFlagsColumns:
         # Members render in declaration order (interactive, keep-awake).
         assert "interactive,keep-awake" in self._row_for(out, h.full("j"))
 
+    @pytest.mark.parametrize("current", [False, True])
+    def test_daemon_flag_columns(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any, current: bool
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"d": {"command": "true", "flags": ["daemon"]}}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        self._status("job,daemon,flags", config_current=current)
+        out = capsys.readouterr().out
+        row = self._row_for(out, h.full("d"))
+        assert row.split()[-2:] == ["true", "daemon"]
+        assert "^" not in row
+
     def test_flags_summary_empty_when_no_flag_enabled(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:

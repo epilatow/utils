@@ -1243,7 +1243,7 @@ class TestDaemonSnapshot:
     torn down as one."""
 
     def _snap(self, **over: Any) -> Any:
-        body: dict[str, Any] = {"command": "serve", "daemon": True}
+        body: dict[str, Any] = {"command": "serve", "flags": ["daemon"]}
         body.update(over)
         return _resolve_snapshot_for(_parse({"job": {"d": body}}), "d")
 
@@ -1260,7 +1260,10 @@ class TestDaemonSnapshot:
         snap = self._snap()
         assert isinstance(snap.timing, Daemon)
         assert snap.to_dict()["daemon"] is True
-        assert isinstance(snapshot_from_dict(snap.to_dict()).timing, Daemon)
+        assert snap.flags == JobFlags.DAEMON
+        restored = snapshot_from_dict(snap.to_dict())
+        assert isinstance(restored.timing, Daemon)
+        assert restored.flags == snap.flags
 
     def test_schema_is_current(self) -> None:
         # The `daemon` key raised the schema, and every version still in
