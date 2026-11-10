@@ -2258,17 +2258,16 @@ def _render_crony_bundle(
     comments in the header so a later render can reproduce them (see
     `_selection_from`).
 
-    priority, the keep-awake flag, env, and the wallclock cap are
-    identical for every job, so they live in `[defaults]` (no job
-    overrides them) rather than being repeated per job. The defaults run
-    all jobs un-throttled (`priority = high`), hold the machine awake
-    (`flags = ["keep-awake"]`), and use `_crony_job_path` for the shared
-    environment. Only `create` reads protected user files, and only on
-    macOS does that need a grant, so on macOS it alone adds
-    `full-disk-access` to its flags (composing with the inherited
-    keep-awake) and crony routes it through Crony.app for the grant; on
-    Linux a user systemd job already reads everything the user owns, so
-    the flag is omitted and create runs without it.
+    The shared priority, flags, env, and wallclock cap live in
+    `[defaults]` rather than being repeated per job. The defaults run
+    all jobs un-throttled (`priority = high`), require networking and hold
+    the machine awake (`flags = ["keep-awake", "network-required"]`),
+    and use `_crony_job_path` for the shared environment. Only `create`
+    reads protected user files, and only on macOS does that need a grant,
+    so on macOS it alone adds `full-disk-access` to its flags, composing
+    with the inherited defaults. Crony routes it through Crony.app for
+    the grant; on Linux a user systemd job already reads everything the
+    user owns, so the flag is omitted and create runs without it.
     The bundle default `notify-channels` is ["default"], plus
     "dialog-popup" on macOS only (a desktop dialog, undeliverable on
     Linux), so a failing check notifies through the user's default crony
@@ -2324,7 +2323,7 @@ def _render_crony_bundle(
             "notify-channels": default_channels,
             "job-timeout-sec": 0,
             "priority": "high",
-            "flags": ["keep-awake"],
+            "flags": ["keep-awake", "network-required"],
             "env": {"PATH": _crony_job_path()},
         },
         "job": jobs,
@@ -3807,6 +3806,8 @@ def args_parser() -> StrictArgumentParser:
             "reuses the bundle's recorded job selection. The opt-in rsync\n"
             "verify job is selected with --include rsync. On macOS the\n"
             "create job runs with Full Disk Access permissions.\n"
+            "All jobs use crony's network-required flag and are canceled if\n"
+            "its network check fails.\n"
             "Jobs use borgadm from PATH when available, or this script\n"
             "otherwise, and their PATH includes uv's detected directory."
         ),

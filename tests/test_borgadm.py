@@ -74,6 +74,7 @@ from conftest_borgadm import mock_cfg as _mock_cfg_fixture  # noqa: E402, F401
 import borgadm.errors as berr  # noqa: E402
 import borgadm_cli as ba  # noqa: E402
 import crony.cli as crony_cli  # noqa: E402
+import crony.config as crony_config  # noqa: E402
 import crony.runner as crony_runner  # noqa: E402
 import crony.unit  # noqa: E402
 
@@ -1235,16 +1236,16 @@ class TestAutomate(CronyAutomateBase):
         # checks keep the default (a check warning is a real signal).
         assert doc["job"]["create"]["success-exit-codes"] == [1]
         assert "success-exit-codes" not in doc["job"]["check-age"]
-        # priority, the keep-awake flag, env, and the disabled wallclock
-        # cap are the same for every job, so they live in [defaults] and
-        # no job overrides them. (borgadm caps each borg command itself,
-        # so job-timeout-sec = 0 leaves that timeout the sole authority.)
+        # priority, the shared flags, env, and the disabled wallclock
+        # cap apply to every job through [defaults]. borgadm caps each
+        # borg command itself, so job-timeout-sec = 0 leaves that timeout
+        # the sole authority.
         assert doc["defaults"]["priority"] == "high"
-        assert doc["defaults"]["flags"] == ["keep-awake"]
+        assert doc["defaults"]["flags"] == ["keep-awake", "network-required"]
         assert doc["defaults"]["job-timeout-sec"] == 0
         # Only create reads protected files, so it alone adds the
-        # full-disk-access flag (composing with the inherited keep-awake);
-        # the checks carry no own flags and inherit keep-awake.
+        # full-disk-access flag (composing with the inherited defaults);
+        # the checks carry no own flags and inherit those defaults.
         assert doc["job"]["create"]["flags"] == ["full-disk-access"]
         for op in self.JOB_OPS:
             assert "priority" not in doc["job"][op]
@@ -1255,6 +1256,28 @@ class TestAutomate(CronyAutomateBase):
         # The bundle deploys on any host that applies it.
         assert set(doc["target"]) == {"all"}
         assert doc["target"]["all"]["jobs"] == self.JOB_OPS
+
+    @pytest.mark.parametrize("system", ["Darwin", "Linux"])
+    def test_all_generated_jobs_require_network(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
+    ) -> None:
+        monkeypatch.setattr(ba.platform, "system", lambda: system)
+        for label, text in self.render_cases(monkeypatch):
+            path = tmp_path / f"{label}.toml"
+            path.write_text(text)
+            config = crony_config.TomlBundle.load("borgadm", path).config
+            target = config.resolve_target("test-host", system.lower())
+            flags = config.resolved_flags_by_name(target)
+            assert set(flags) == set(config.jobs), label
+            for name, resolved in flags.items():
+                assert crony_config.JobFlags.NETWORK_REQUIRED in resolved, (
+                    label,
+                    name,
+                )
+                assert crony_config.JobFlags.KEEP_AWAKE in resolved
+                assert (crony_config.JobFlags.FULL_DISK_ACCESS in resolved) == (
+                    system == "Darwin" and name == "create"
+                )
 
     @pytest.mark.parametrize("system", ["Darwin", "Linux"])
     @pytest.mark.parametrize("relative_uv", [False, True])

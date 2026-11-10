@@ -116,8 +116,10 @@ Write borgadm's crony(1) bundle and deploy the scheduled backup-creation and
 check jobs (via launchd on macOS, systemd on Linux). Passing neither --include
 nor --exclude reuses the bundle's recorded job selection. The opt-in rsync
 verify job is selected with --include rsync. On macOS the create job runs with
-Full Disk Access permissions. Jobs use borgadm from PATH when available, or
-this script otherwise, and their PATH includes uv's detected directory.
+Full Disk Access permissions. All jobs use crony's network-required flag and
+are canceled if its network check fails. Jobs use borgadm from PATH when
+available, or this script otherwise, and their PATH includes uv's detected
+directory.
 
 - **`--config-only`**\
   only write the bundle file; skip running crony apply
