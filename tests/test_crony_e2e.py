@@ -533,6 +533,29 @@ class TestApplyLifecycle:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
+    @pytest.mark.parametrize("group", [False, True])
+    def test_compatible_snapshot_version_remains_synced(
+        self, e2e: _CronyE2E, group: bool
+    ) -> None:
+        root = "batch" if group else "probe"
+        jobs = '[job.probe]\ncommand = "true"\n'
+        if group:
+            jobs += '[job-group.batch]\njobs = ["probe"]\non-demand = true\n'
+        else:
+            jobs += "on-demand = true\n"
+        e2e.write_bundle(jobs, [root])
+        full = e2e.full(root)
+        e2e.crony("apply", full)
+        path = e2e.state_dir / E2E_BUNDLE / root / "snapshot.json"
+        snapshot = json.loads(path.read_text())
+        snapshot["schema"] = 10
+        snapshot.pop("network-required")
+        path.write_text(json.dumps(snapshot))
+        saved = path.read_bytes()
+        assert e2e.status_config(full) == "synced"
+        e2e.crony("apply", full)
+        assert path.read_bytes() == saved
+
     def test_network_required_cancels_before_command(
         self, e2e: _CronyE2E
     ) -> None:

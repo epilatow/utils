@@ -300,9 +300,9 @@ class _JobCommon:
     """
 
     # The snapshot.json format version, serialized under the `schema`
-    # JSON key. Compared in `==`, so a snapshot whose format predates the
-    # current code surfaces as drift (reported `snapshot-schema`).
-    snapshot_schema: int
+    # JSON key. Format metadata does not affect configuration equality;
+    # supported versions load with migrations and defaults applied.
+    snapshot_schema: int = field(compare=False)
     kind: crony.unit.EntityKind  # whether this entry is a job or a group
     bundle: str  # the bundle namespace; uuids are unique within it
     name: str  # the short name (the part after the bundle)

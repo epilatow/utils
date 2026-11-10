@@ -116,8 +116,8 @@ def _priority_display(
 # the interactive `_sec` snapshot fields store resolved seconds but the
 # config knobs take a time-span string (`interactive-active` /
 # `interactive-delay`). Any field not listed falls back to its
-# dash-translated attribute name (so `snapshot_schema` reads
-# `snapshot-schema`, `state_dir_symlink` reads `state-dir-symlink`).
+# dash-translated attribute name (so `state_dir_symlink` reads
+# `state-dir-symlink`).
 _STALE_FIELD_LABELS: dict[str, str] = {
     "timing": "schedule",
     "timeout": "job-timeout-sec",
@@ -137,9 +137,9 @@ def _stale_fields(
     Only `compare=True` fields are diffed, mirroring the dataclass `==`
     the stale verdict itself uses. A config knob is reported by the name
     the config file uses for it (see `_STALE_FIELD_LABELS`); any other
-    field falls back to its dash-spelled attribute (`snapshot_schema` ->
-    `snapshot-schema`, `state_dir_symlink` -> `state-dir-symlink`). The
-    `flags` bitmask is expanded to the individual capability flags that
+    field falls back to its dash-spelled attribute (e.g.
+    `state_dir_symlink` -> `state-dir-symlink`). The `flags` bitmask is
+    expanded to the individual capability flags that
     changed (e.g. `keep-awake`), and `rendered_units` to the per-unit
     labels that drifted (`unit-config-1` / `unit-config-2`), rather than
     the field name. A dead schedule reports `unit-armed` -- so a `broken`

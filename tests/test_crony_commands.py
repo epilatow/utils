@@ -3848,9 +3848,10 @@ class TestStatusFieldColumns:
             ),
         )
         assert d(jnode, both) == "unit-config-1,unit-config-2"
-        # A snapshot-format bump labels as `snapshot-schema`, not `schema`.
+        # Format metadata does not describe a configuration difference.
         bumped = dataclasses.replace(jnode, snapshot_schema=4)
-        assert d(jnode, bumped) == "snapshot-schema"
+        assert jnode == bumped
+        assert d(jnode, bumped) == ""
 
     def test_stale_expands_changed_flag_to_its_token(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7112,7 +7113,7 @@ class TestLogsByEntityRef:
 
 class TestStatusBrokenSurface:
     """`crony status` surfaces broken entries with `CONFIG=broken`
-    so a schema-bump or corrupt-snapshot failure becomes visible
+    so an unsupported-schema or corrupt-snapshot failure becomes visible
     instead of looking like ordinary stale drift. Recovered-name
     broken entries render under their normal name; entries with
     no recoverable name (corrupt JSON) render as
@@ -8278,7 +8279,7 @@ class TestSnapshotLifecycle:
     the runner reads from the snapshot, not the live config. These
     tests exercise the snapshot file lifecycle (write, read, refuse
     on schema mismatch) and the drift-detection invariant (an edit
-    to any snapshot-covered field surfaces as "updated" via
+    to any compared configuration field surfaces as "updated" via
     dataclass-equality comparison against the on-disk snapshot).
     """
 
@@ -8645,19 +8646,19 @@ class TestSnapshotLifecycle:
         )
         assert h.apply("j") == "updated"
 
+    @pytest.mark.parametrize("schema", [3, 999])
     def test_load_snapshot_refuses_schema_mismatch(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, schema: int
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         uuid_value = "deadbeef-uuid"
         sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
-        # schema=999 simulates a future version we don't support.
         (sd / "snapshot.json").write_text(
-            '{"schema": 999, "kind": "job", "name": "default.j"}',
+            json.dumps({"schema": schema, "kind": "job", "name": "default.j"}),
             encoding="utf-8",
         )
-        with pytest.raises(PreconditionError, match="schema 999"):
+        with pytest.raises(PreconditionError, match=f"schema {schema}"):
             crony_runtime.load_snapshot(
                 EntityRef(DEFAULT_BUNDLE_NAME, uuid_value)
             )

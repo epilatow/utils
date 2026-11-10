@@ -221,6 +221,8 @@ CURRENT_SNAPSHOT_SCHEMA: int = max(_model_field_versions())
 # The oldest schema `parse` still reads forward (via `_migrate` and field
 # defaults). Raise it -- and drop the matching `_migrate` step -- once no
 # snapshots at the old version remain.
+# Compatible snapshots are not rewritten just to advance their version;
+# verify the installed versions before raising the floor.
 _COMPAT_FLOOR_SCHEMA: int = 4
 
 # Every schema version current code can still load: the floor through

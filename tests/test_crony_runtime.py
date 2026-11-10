@@ -235,6 +235,57 @@ class TestConfigState:
         config = crony_runtime.load_config()
         assert config.cfg_status(self._ref(config, "default.j")) == "stale"
 
+    @pytest.mark.parametrize("group", [False, True])
+    def test_compatible_snapshot_compares_effective_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group: bool
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        root = "g" if group else "j"
+        entry: dict[str, object] = {"on-demand": True}
+        if group:
+            entry["jobs"] = ["j"]
+            raw: dict[str, object] = {
+                "job": {"j": {"command": "true"}},
+                "job-group": {"g": entry},
+            }
+        else:
+            entry["command"] = "true"
+            raw = {"job": {"j": entry}}
+        h.config(raw, default_target_jobs=[root])
+        h.apply(root)
+        path = h.state_dir(root) / "snapshot.json"
+        old = json.loads(path.read_text())
+        old["schema"] = 10
+        old.pop("network-required")
+        path.write_text(json.dumps(old))
+        saved = path.read_bytes()
+
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full(root)]
+        current = config.current.job_from_ref(ref)
+        pending = config.pending.job_from_ref(ref)
+        assert current is not None and pending is not None
+        assert current.snapshot_schema == 10
+        assert pending.snapshot_schema == CURRENT_SNAPSHOT_SCHEMA
+        assert config.cfg_status(ref) == ConfigStatus.SYNCED
+        assert crony_commands._stale_fields(pending, current) == ""
+        assert crony_runtime.load_snapshot(ref).to_dict()["schema"] == 10
+        assert h.apply(root) == crony_runtime.ApplyResult.UNCHANGED
+        assert path.read_bytes() == saved
+
+        entry["flags"] = ["network-required"]
+        h.config(raw, default_target_jobs=[root])
+        changed = crony_runtime.load_config()
+        assert changed.cfg_status(ref) == ConfigStatus.STALE
+        assert (
+            crony_commands._stale_fields(
+                changed.pending.job_from_ref(ref),
+                changed.current.job_from_ref(ref),
+            )
+            == "network-required"
+        )
+        assert path.read_bytes() == saved
+
     def test_orphan_stamped_not_in_config(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -924,14 +975,15 @@ class TestConfigBroken:
         (sd / "snapshot.json").write_text(contents, encoding="utf-8")
         return EntityRef("default", uuid_value), sd
 
+    @pytest.mark.parametrize("schema", [3, 999])
     def test_wrong_schema_recorded_as_broken(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, schema: int
     ) -> None:
         self._setup(tmp_path, monkeypatch)
         ref, _ = self._plant_state(
             "11111111-1111-1111-1111-111111111111",
             json.dumps(
-                {"schema": 999, "kind": "job", "name": "default.legacy"}
+                {"schema": schema, "kind": "job", "name": "default.legacy"}
             ),
         )
         config = crony_runtime.load_config()
@@ -942,7 +994,7 @@ class TestConfigBroken:
         # files normal current entries read.
         assert ref in config.runtime
         assert config.orphans[ref].name == "default.legacy"
-        assert "schema 999" in (config.orphans[ref].reason or "")
+        assert f"schema {schema}" in (config.orphans[ref].reason or "")
         assert config.cfg_status(ref) == "broken"
         # Name-recovery let it land in orphans_by_full_name.
         assert config.orphans_by_full_name.get("default.legacy") == ref

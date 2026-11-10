@@ -2631,11 +2631,9 @@ def do_run(ref: str) -> None:
     to the user's command"). A daemon whose
     precondition keeps failing spends its retry budget on those
     launches; the one that exhausts it records `fail` and exits zero,
-    so the supervisor stops restarting it. Without this
-    record the scheduled fire fails, leaving the prior outcome in
-    place: a snapshot-schema bump looks like ordinary
-    "edited config, not yet applied" drift, and a per-run precondition
-    surfaces only as a `crashed` launch with no explanation.
+    so the supervisor stops restarting it. Recording the failed launch
+    keeps its outcome and reason visible instead of leaving an earlier
+    run's result in place.
     """
     parsed = crony.unit.EntityRef.from_str(ref)
     if parsed is None:
