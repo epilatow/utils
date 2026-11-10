@@ -46,6 +46,8 @@ DEFAULT_BUNDLE_NAME: str = "default"
 # rejected).
 NOTIFY_INHERIT_TOKEN: str = DEFAULT_BUNDLE_NAME
 
+DEFAULT_NETWORK_CHECK_HTTPS: tuple[str, ...] = ("cloudflare.com", "google.com")
+
 
 # =============================================================================
 # DATA CLASSES
@@ -67,6 +69,7 @@ class JobFlags(enum.Flag):
     FULL_DISK_ACCESS = enum.auto()
     DAEMON = enum.auto()
     DISABLED = enum.auto()
+    NETWORK_REQUIRED = enum.auto()
 
     @property
     def token(self) -> JobFlagNames:
@@ -127,6 +130,7 @@ class JobFlagNames(enum.StrEnum):
     FULL_DISK_ACCESS = "full-disk-access"
     DAEMON = "daemon"
     DISABLED = "disabled"
+    NETWORK_REQUIRED = "network-required"
 
 
 assert {n.name for n in JobFlagNames} == {f.name for f in JobFlags.members()}, (
@@ -169,6 +173,10 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
         "and groups. Later applies preserve the applied enabled/disabled "
         "state; use `enable` or `disable` to change it. A new UUID or "
         "destroy followed by apply uses this initial setting again."
+    ),
+    JobFlags.NETWORK_REQUIRED: (
+        "Cancel the run before executing its command when none of the "
+        "bundle's network-check-https hosts responds over verified HTTPS."
     ),
 }
 
@@ -462,6 +470,10 @@ class Defaults:
     # Catches "start seemed to succeed but nothing happened"
     # cases (invalid unit, queue stalled, etc.).
     start_timeout_sec: int = 15
+    # Bundle-only, read live at fire time rather than pinned by apply.
+    network_check_https: list[str] = field(
+        default_factory=lambda: list(DEFAULT_NETWORK_CHECK_HTTPS)
+    )
     # Cascaded to jobs that don't set their own; see TomlJob.priority /
     # TomlJob.keep_awake. None / False keep today's per-job behavior
     # when a bundle sets no default.
@@ -1569,6 +1581,7 @@ _KNOWN_DEFAULTS: frozenset[str] = (
             "notify-success-ratio",
             "job-timeout-sec",
             "start-timeout-sec",
+            "network-check-https",
             "priority",
             "flags",
             "env",
@@ -2270,6 +2283,34 @@ def _parse_notify_success_ratio(
     return _parse_success_ratio_value(val, where)
 
 
+def _parse_network_check_https(raw: dict[str, Any], where: str) -> list[str]:
+    key = "network-check-https"
+    if key not in raw:
+        return list(DEFAULT_NETWORK_CHECK_HTTPS)
+    hosts = _string_list(raw, key, where)
+    if not hosts:
+        raise crony.errors.ConfigError(f"{where}: '{key}' must not be empty")
+    seen: set[str] = set()
+    label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    for host in hosts:
+        hostname = host.removesuffix(".")
+        if len(hostname) > 253 or not re.fullmatch(
+            rf"{label}(?:\.{label})*", hostname
+        ):
+            raise crony.errors.ConfigError(
+                f"{where}: '{key}' entry {host!r} must be a hostname "
+                "without a scheme, port, or path"
+            )
+        normalized = hostname.lower()
+        if normalized in seen:
+            raise crony.errors.ConfigError(
+                f"{where}: '{key}' host {host!r} listed twice"
+            )
+        seen.add(normalized)
+    # TLS certificate hostnames omit the DNS root dot.
+    return [host.removesuffix(".") for host in hosts]
+
+
 def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     """Parse [defaults].
 
@@ -2325,6 +2366,7 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         start_timeout_sec=_positive_int(
             raw, "start-timeout-sec", where, default=15
         ),
+        network_check_https=_parse_network_check_https(raw, where),
         priority=_parse_priority_field(raw, where),
         keep_awake=flags.get(JobFlags.KEEP_AWAKE, False),
         flags=flags,

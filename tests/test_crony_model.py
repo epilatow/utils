@@ -339,6 +339,45 @@ class TestJobFlagsBacking:
         assert d["full-disk-access"] is True
         assert snapshot_from_dict(d).flags == snap.flags
 
+    def test_network_required_round_trips_without_check_hosts(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"network-check-https": ["example.com"]},
+                "job": {"j": _job(flags=["network-required"])},
+            }
+        )
+        snap = _resolve_snapshot_for(cfg, "j")
+        assert snap.flags == JobFlags.NETWORK_REQUIRED
+        data = snap.to_dict()
+        assert data["network-required"] is True
+        assert "network-check-https" not in data
+        assert snapshot_from_dict(data).flags == snap.flags
+        cfg.defaults.network_check_https = ["other.example"]
+        assert _resolve_snapshot_for(cfg, "j") == snap
+
+    def test_old_snapshot_defaults_network_required_to_false(self) -> None:
+        data = self._snap().to_dict()
+        data["schema"] = 10
+        data.pop("network-required")
+        assert JobFlags.NETWORK_REQUIRED not in snapshot_from_dict(data).flags
+
+    def test_group_preserves_network_required_for_cascade(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"j": _grouped_job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["j"],
+                        "schedule": "daily",
+                        "flags": ["network-required"],
+                    }
+                },
+            }
+        )
+        snap = _resolve_snapshot_for(cfg, "g")
+        assert snap.flags == JobFlags.NETWORK_REQUIRED
+        assert snapshot_from_dict(snap.to_dict()).flags == snap.flags
+
     def test_snapshot_serializes_flags_as_booleans(self) -> None:
         snap = self._snap(keep_awake=True)
         d = snap.to_dict()

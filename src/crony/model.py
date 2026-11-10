@@ -57,6 +57,8 @@ from crony.platform.fda import FDAWrapper
 # separable from "what runs", and notify edits should take effect
 # without a re-apply. The runner reads them from the live config
 # at fire time.
+# The bundle-only network-check-https setting is also read live; the
+# per-job network-required flag itself remains pinned.
 
 
 # The per-entry log file name, kept in one place so no caller inlines
@@ -819,6 +821,9 @@ class Job(_JobCommon):
             full_disk_access=(
                 crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
             ),
+            network_required=(
+                crony.config.JobFlags.NETWORK_REQUIRED in self.flags
+            ),
             command=self.command,
             script=self.script,
             args=self.args,
@@ -1037,6 +1042,9 @@ class JobGroup(_JobCommon):
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
             full_disk_access=(
                 crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
+            ),
+            network_required=(
+                crony.config.JobFlags.NETWORK_REQUIRED in self.flags
             ),
             children=[r.uuid for r in self.children],
             start_timeout_sec=self.start_timeout_sec,
@@ -1500,7 +1508,8 @@ class JobStatus(_DescribedStrEnum):
         ExitClass.CANCELED,
         (
             "Jobs and groups. A run canceled or skipped before its command "
-            "ran -- for an interactive job, one the user declined. A job "
+            "ran -- for an interactive job, one the user declined; for a "
+            "network-required job, one whose network check failed. A job "
             "whose command script is missing or not executable is canceled "
             "when its gate passes or it has no gate. A scheduler stop "
             "before a job's command started (its unit "

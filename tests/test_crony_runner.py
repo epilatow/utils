@@ -47,6 +47,7 @@ from conftest_crony import (  # noqa: E402
 
 from crony import commands as crony_commands  # noqa: E402
 from crony import config as crony_config  # noqa: E402
+from crony import network as crony_network  # noqa: E402
 from crony import notify as crony_notify  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
@@ -372,6 +373,111 @@ class TestRuntimeEnvExpansion:
         assert env["DIGIT"] == "$1 is not an identifier"
         assert env["TRAILING"] == "ends with $"
         assert env["BRACE_NO_CLOSE"] == "starts ${UNCLOSED"
+
+
+class TestNetworkRequired:
+    def test_applied_flag_uses_live_check_hosts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        raw: dict[str, Any] = {
+            "defaults": {"network-check-https": ["old.example"]},
+            "job": {
+                "j": {
+                    "command": "true",
+                    "schedule": "daily",
+                    "flags": ["network-required"],
+                }
+            },
+        }
+        cfg = h.config(raw, default_target_jobs=["j"])
+        h.write_snap(cfg, "j")
+        raw["defaults"]["network-check-https"] = ["new.example"]
+        h.config(raw, default_target_jobs=["j"])
+        with mock.patch(
+            "http.client.HTTPSConnection", autospec=True
+        ) as connection:
+            with pytest.raises(SystemExit) as exc:
+                crony_runner.do_run(h.ref("j"))
+            assert exc.value.code == 0
+            connection.assert_called_once_with("new.example", timeout=5)
+        assert h.last_run("j")["exit_class"] == "ok"
+
+    @pytest.mark.parametrize("available", [False, True])
+    @pytest.mark.parametrize("daemon", [False, True])
+    def test_required_network_controls_execution(
+        self,
+        available: bool,
+        daemon: bool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        marker = tmp_path / "executed"
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": f"touch {shlex.quote(str(marker))}",
+                        "flags": ["network-required", "daemon"]
+                        if daemon
+                        else ["network-required"],
+                        **({} if daemon else {"schedule": "daily"}),
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with mock.patch.object(
+            crony_network,
+            "check_bundle_network",
+            autospec=True,
+            return_value=available,
+        ) as check:
+            rc = crony_runner._run_job(h.snap(cfg, "j"))
+            check.assert_called_once()
+            assert check.call_args.args[0] == "default"
+        assert marker.exists() == available
+        assert h.last_run("j")["exit_class"] == (
+            "ok" if available else "canceled"
+        )
+        assert rc == (
+            int(ExitCode.DAEMON_EXITED) if daemon and available else 0
+        )
+        if not available:
+            assert h.last_run("j")["notifications"] == {}
+            assert not (h.state_dir("j") / "exit-history.json").exists()
+
+    @pytest.mark.parametrize("gate", [None, "false"])
+    def test_unneeded_check_is_not_performed(
+        self,
+        gate: str | None,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        **(
+                            {"gate": gate, "flags": ["network-required"]}
+                            if gate
+                            else {}
+                        ),
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with mock.patch.object(
+            crony_network, "check_bundle_network", autospec=True
+        ) as check:
+            assert crony_runner._run_job(h.snap(cfg, "j")) == 0
+            check.assert_not_called()
+        assert h.last_run("j")["exit_class"] == ("gated" if gate else "ok")
 
 
 class TestRunJobBasics:

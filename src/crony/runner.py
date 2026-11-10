@@ -41,6 +41,7 @@ import crony.config
 import crony.errors
 import crony.launch
 import crony.model
+import crony.network
 import crony.notify
 import crony.platform
 import crony.runtime
@@ -632,6 +633,38 @@ def _throttle_daemon_restart(
     _delay_or_bypass(delay, bypass_check=rearm_requested, poll_sec=0.1)
 
 
+def _record_canceled_job(
+    snap: crony.model.Job,
+    *,
+    gate: crony.model.GateResult,
+    started: float,
+    started_iso: str,
+) -> int:
+    """Record a decided pre-command cancellation without failure history
+    or notifications, leaving a daemon stopped with a fresh retry budget."""
+    _ignore_signals(_GUARD_SIGNALS)
+    if crony.unit.is_daemon(snap.timing):
+        crony.runtime.clear_exit_history(snap.state_dir)
+    result = crony.model.JobRunResult(
+        host=crony.platform.current_host(),
+        platform=crony.platform.current_platform(),
+        started_at=started_iso,
+        ended_at=crony.runtime.now_iso(),
+        duration_sec=time.time() - started,
+        exit_class=crony.model.ExitClass.CANCELED,
+        exit_code=0,
+        signal=None,
+        process_exit=0,
+        gate=gate,
+        log_path=str(snap.log_path),
+        notifications={},
+    )
+    crony.runtime.write_last_run(
+        snap.state_dir / "last-run.json", dataclasses.asdict(result)
+    )
+    return 0
+
+
 def _run_job(snap: crony.model.Job) -> int:
     """Run a single job from its applied snapshot.
 
@@ -855,27 +888,25 @@ def _run_job(snap: crony.model.Job) -> int:
                         finally:
                             pending_flag.unlink(missing_ok=True)
                         if choice == _InteractiveChoice.CANCEL:
-                            # Decided, like the gated skip above: absorb a
-                            # stop or timeout hint and record the decline.
-                            _ignore_signals(_GUARD_SIGNALS)
-                            result = crony.model.JobRunResult(
-                                host=crony.platform.current_host(),
-                                platform=crony.platform.current_platform(),
-                                started_at=started_iso,
-                                ended_at=crony.runtime.now_iso(),
-                                duration_sec=time.time() - started,
-                                exit_class=crony.model.ExitClass.CANCELED,
-                                exit_code=0,
-                                signal=None,
-                                process_exit=0,
+                            return _record_canceled_job(
+                                snap,
                                 gate=gate,
-                                log_path=str(snap.log_path),
-                                notifications={},
+                                started=started,
+                                started_iso=started_iso,
                             )
-                            crony.runtime.write_last_run(
-                                sd / "last-run.json", dataclasses.asdict(result)
-                            )
-                            return 0
+
+                if (
+                    crony.config.JobFlags.NETWORK_REQUIRED in snap.flags
+                    and not crony.network.check_bundle_network(
+                        snap.bundle, log_file
+                    )
+                ):
+                    return _record_canceled_job(
+                        snap,
+                        gate=gate,
+                        started=started,
+                        started_iso=started_iso,
+                    )
 
                 # keep-awake stays outermost so the power assertion is
                 # held for the whole run, the FDA wrapper included.

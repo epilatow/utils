@@ -64,6 +64,74 @@ from crony.unit import (  # noqa: E402
 _script_path = REPO_ROOT / "src" / "crony" / "config.py"
 
 
+class TestNetworkCheckHttps:
+    def test_builtin_hosts_are_per_bundle(self) -> None:
+        configs: tuple[dict[str, Any], ...] = ({}, {"defaults": {}})
+        for name in ("default", "backup"):
+            for raw in configs:
+                cfg = TomlBundleConfig._from_raw(raw, bundle_name=name)
+                assert cfg.defaults.network_check_https == [
+                    "cloudflare.com",
+                    "google.com",
+                ]
+
+    @pytest.mark.parametrize("host", ["example.com", "example.com."])
+    def test_explicit_hosts_replace_builtin_list(self, host: str) -> None:
+        cfg = _parse({"defaults": {"network-check-https": [host]}})
+        assert cfg.defaults.network_check_https == ["example.com"]
+
+    @pytest.mark.parametrize(
+        "hosts",
+        [
+            [],
+            None,
+            "example.com",
+            [1],
+            [""],
+            ["https://example.com"],
+            ["example.com/"],
+            ["example.com:443"],
+            [" example.com"],
+            ["bad_label.example"],
+            ["-bad.example"],
+            ["a" * 64 + ".com"],
+            ["example.com", "EXAMPLE.COM."],
+        ],
+    )
+    def test_invalid_hosts_rejected(self, hosts: Any) -> None:
+        with pytest.raises(ConfigError, match="network-check-https"):
+            _parse({"defaults": {"network-check-https": hosts}})
+
+    def test_setting_rejected_outside_defaults(self) -> None:
+        setting = {"network-check-https": ["example.com"]}
+        with pytest.raises(ConfigError, match="unknown key"):
+            _parse(setting)
+        _assert_errored_job({"job": {"j": _job(**setting)}}, "j", "unknown key")
+        _assert_errored_job_group(
+            {"job-group": {"g": {"jobs": [], **setting}}},
+            "g",
+            "unknown key",
+        )
+        with pytest.raises(ConfigError, match="unknown key"):
+            _parse({"target": {"all": {"jobs": [], **setting}}})
+
+    def test_flag_cascades_and_can_be_disabled(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"flags": ["network-required"]},
+                "job-group": {"g": {"jobs": ["a", "b"], "schedule": "daily"}},
+                "job": {
+                    "a": _grouped_job(),
+                    "b": _grouped_job(flags=["network-required=false"]),
+                },
+                "target": {"all": {"jobs": ["g"]}},
+            }
+        )
+        flags = cfg.resolved_flags_by_name(cfg.resolve_target("h", "linux"))
+        assert flags["g"] == flags["a"] == JobFlags.NETWORK_REQUIRED
+        assert flags["b"] == JobFlags(0)
+
+
 class TestParseDefaults:
     def test_start_timeout_key(self) -> None:
         cfg = _parse({"defaults": {"start-timeout-sec": 3}})
@@ -3383,6 +3451,7 @@ class TestJobFlags:
             JobFlags.FULL_DISK_ACCESS,
             JobFlags.DAEMON,
             JobFlags.DISABLED,
+            JobFlags.NETWORK_REQUIRED,
         ]
 
 

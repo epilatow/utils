@@ -35,9 +35,9 @@
 # ----------------------------------------------------------------------------
 # defaults section
 # ----------------------------------------------------------------------------
-# Settings cascaded to every job in THIS bundle. Per-job and
-# per-target settings can override anything here. Defaults from
-# other bundles never apply -- each bundle has its own.
+# Settings for THIS bundle. Some cascade to jobs and can be overridden
+# per job or target; bundle-only settings are identified below. Defaults
+# from other bundles never apply -- each bundle has its own.
 
 #[defaults]
 #notify-channels      = []           # names defined below, or "dialog-popup"
@@ -46,6 +46,7 @@
 #notify-success-ratio = "1/1"        # failure-notification floor (see below)
 #job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
 #start-timeout-sec    = 15           # `crony start --wait` deadline
+#network-check-https  = ["cloudflare.com", "google.com"]
 #priority             = "high"       # priority class; jobs may override
 #keep-awake           = true         # default; jobs may override
 # Optional: capabilities can also be set as a cascading list --
@@ -60,6 +61,23 @@
 #
 #[defaults.env]
 #PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
+
+# Network availability for jobs with the network-required flag. The
+# network-check-https list is bundle-only: valid only under [defaults],
+# never inherited from default.toml, and read live when a run checks the
+# network. Editing it needs no apply and does not mark jobs stale. A
+# missing or invalid bundle config uses the built-in hosts shown above.
+# An explicit list replaces the built-in list; it must contain distinct,
+# nonempty hostnames without schemes, ports, or paths, and cannot be [].
+#
+# After the gate and any interactive wait, crony tries an HTTPS HEAD
+# request to each host in order until one responds. Any HTTP status over
+# certificate-verified HTTPS is sufficient; redirects are not followed.
+# Socket operations have a five-second timeout; DNS uses the OS resolver's
+# timeouts. If every host fails (DNS, connection, TLS, or HTTP protocol),
+# the command is skipped and the run is canceled without notification.
+# A daemon stays stopped, like a failed gate, until its next external
+# start (login, start, apply, or enable).
 
 # Failure-notification floor (notify-success-ratio). A "K/N" string:
 # notify a failed run only when fewer than K of the last N runs
@@ -196,7 +214,8 @@
 #            idle / on-AC machine doesn't sleep mid-job. NOTE: closing
 #            the lid on battery still sleeps the machine -- nothing in
 #            userspace prevents that.
-# Optional: `flags = ["interactive", "keep-awake", "full-disk-access"]`
+#network-required = true       # cancel this run if its HTTPS checks fail
+# Optional: `flags = ["network-required", "keep-awake", "full-disk-access"]`
 # is an alternative spelling for the per-flag booleans above;
 # "flag=false" turns one off (e.g. ["keep-awake=false"]). A flag with
 # its own key may be set that way OR in `flags`, never both at the same

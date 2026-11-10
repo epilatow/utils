@@ -98,6 +98,9 @@ class _SnapshotCommon(_SnapshotModel):
     full_disk_access: Annotated[bool, _Since(5)] = _disk_key(
         "full-disk-access", default=False
     )
+    network_required: Annotated[bool, _Since(11)] = _disk_key(
+        "network-required", default=False
+    )
 
     def entity_name(self) -> crony.unit.EntityName:
         """This snapshot's full `<bundle>.<short>` name as its value
@@ -138,6 +141,8 @@ class _SnapshotCommon(_SnapshotModel):
             flags |= crony.config.JobFlags.DAEMON
         if self.disabled:
             flags |= crony.config.JobFlags.DISABLED
+        if self.network_required:
+            flags |= crony.config.JobFlags.NETWORK_REQUIRED
         return flags
 
 

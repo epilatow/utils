@@ -424,7 +424,7 @@ A declined gate skips the job even if its command script is missing or not execu
 .TP
 \f[I]canceled\f[R]
 Jobs and groups.\&
-A run canceled or skipped before its command ran \-\- for an interactive job, one the user declined.\&
+A run canceled or skipped before its command ran \-\- for an interactive job, one the user declined; for a network\-required job, one whose network check failed.\&
 A job whose command script is missing or not executable is canceled when its gate passes or it has no gate.\&
 A scheduler stop before a job\(aqs command started (its unit stopped or reloaded during its gate or interactive wait) is canceled too, unless it stopped a daemon being disabled.\&
 A scheduler stop also cancels a group during child dispatch.\&
@@ -477,6 +477,9 @@ Start disabled on first apply.\&
 Can be inherited from defaults and groups.\&
 Later applies preserve the applied enabled/disabled state; use \(gaenable\(ga or \(gadisable\(ga to change it.\&
 A new UUID or destroy followed by apply uses this initial setting again.\&
+.TP
+\f[I]network\-required\f[R]
+Cancel the run before executing its command when none of the bundle\(aqs network\-check\-https hosts responds over verified HTTPS.\&
 .SS MASKED values
 .TP
 \f[I]host\f[R]

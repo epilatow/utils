@@ -533,6 +533,26 @@ class TestApplyLifecycle:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
+    def test_network_required_cancels_before_command(
+        self, e2e: _CronyE2E
+    ) -> None:
+        e2e.use_isolated_launcher()
+        # Reserved .invalid cannot supply an HTTPS endpoint; this exercises
+        # the real probe without depending on any external service's uptime.
+        e2e.write_bundle(
+            '[defaults]\nnetwork-check-https = ["crony-check.invalid"]\n'
+            '[job.probe]\ncommand = "false"\non-demand = true\n'
+            'flags = ["network-required"]\n',
+            ["probe"],
+        )
+        full = e2e.full("probe")
+        e2e.crony("apply", full)
+        e2e.crony("start", "--sync", full)
+        e2e.wait_for_recorded_status(full, "canceled")
+        log = (e2e.state_dir / E2E_BUNDLE / "probe" / "run.log").read_text()
+        assert "https://crony-check.invalid/ failed:" in log
+        assert "exec:" not in log
+
     @pytest.mark.parametrize("daemon", [False, True])
     def test_initial_disabled_survives_enable_and_reapply(
         self, e2e: _CronyE2E, daemon: bool

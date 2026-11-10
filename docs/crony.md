@@ -434,12 +434,12 @@ Send a synthetic failure notification.
   command script is missing or not executable.
 - **`canceled`**\
   Jobs and groups. A run canceled or skipped before its command ran -- for an
-  interactive job, one the user declined. A job whose command script is
-  missing or not executable is canceled when its gate passes or it has no
-  gate. A scheduler stop before a job's command started (its unit stopped or
-  reloaded during its gate or interactive wait) is canceled too, unless it
-  stopped a daemon being disabled. A scheduler stop also cancels a group
-  during child dispatch.
+  interactive job, one the user declined; for a network-required job, one
+  whose network check failed. A job whose command script is missing or not
+  executable is canceled when its gate passes or it has no gate. A scheduler
+  stop before a job's command started (its unit stopped or reloaded during its
+  gate or interactive wait) is canceled too, unless it stopped a daemon being
+  disabled. A scheduler stop also cancels a group during child dispatch.
 - **`stopped`**\
   Jobs and groups. The last run was cut short by `crony stop`, or a running
   daemon was stopped by `crony disable`.
@@ -482,6 +482,9 @@ Send a synthetic failure notification.
   Later applies preserve the applied enabled/disabled state; use `enable` or
   `disable` to change it. A new UUID or destroy followed by apply uses this
   initial setting again.
+- **`network-required`**\
+  Cancel the run before executing its command when none of the bundle's
+  network-check-https hosts responds over verified HTTPS.
 
 ### MASKED values
 
