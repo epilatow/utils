@@ -234,7 +234,12 @@ Always exits 0 \-\- this is a filter on the display, not a gate.\&
 .RE
 .TP
 \f[B]logs\f[R] [\-n N] [\-s SINCE] [\-t | \-l] [\-p] job
-Print a job\(aqs recent log output.\&
+Crony\(aqs own log lines start with \(aq> crony: \(aq.\&
+Command output is preserved as written.\&
+Each completed run ends with its exit status, an optional terminating signal, and runtime (HH:MM:SS).\&
+A command\(aqs exit status is its actual code, including configured success codes, or 128 + the signal number.\&
+Runs skipped before the command starts report crony\(aqs exit status.\&
+Runtime includes gates and interactive waits.\&
 .RS
 .TP
 \f[CR]\-n N\f[R]
@@ -479,7 +484,7 @@ Later applies preserve the applied enabled/disabled state; use \(gaenable\(ga or
 A new UUID or destroy followed by apply uses this initial setting again.\&
 .TP
 \f[I]network\-required\f[R]
-Cancel the run before executing its command when none of the bundle\(aqs network\-check\-https hosts responds over verified HTTPS.\&
+Cancel the run before executing its command when none of the bundle\(aqs network\-check\-https hosts returns HTTP 200 over verified HTTPS.\&
 .SS MASKED values
 .TP
 \f[I]host\f[R]

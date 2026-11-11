@@ -71,8 +71,8 @@ class TestNetworkCheckHttps:
             for raw in configs:
                 cfg = TomlBundleConfig._from_raw(raw, bundle_name=name)
                 assert cfg.defaults.network_check_https == [
-                    "cloudflare.com",
-                    "google.com",
+                    "www.cloudflare.com",
+                    "www.google.com",
                 ]
 
     @pytest.mark.parametrize("host", ["example.com", "example.com."])

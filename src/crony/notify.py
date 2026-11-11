@@ -26,6 +26,7 @@ from pathlib import Path
 
 import crony.config
 import crony.errors
+import crony.log
 import crony.model
 import crony.platform
 import crony.runtime
@@ -118,9 +119,9 @@ def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
 
 # Each `crony _run` invocation writes a header line to run.log.
 # Two shapes:
-#   === <ISO ts> <full.name> pid=<N> ===
+#   > crony: === <ISO ts> <full.name> pid=<N> ===
 #       Ordinary run: name resolved, snapshot loaded, pid known.
-#   === <ISO ts> CANCELED <bundle>:<uuid> ===
+#   > crony: === <ISO ts> CANCELED <bundle>:<uuid> ===
 #       Snapshot couldn't be loaded (missing, unreadable, wrong
 #       schema, unknown kind). No pid; the line surfaces the
 #       cancel for `crony logs --latest`.
@@ -130,7 +131,7 @@ def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
 # the log-bearing notify transports, email and ntfy, each of which
 # inlines the slice under its own size budget rather than attaching
 # the whole file.
-_RUN_HEADER_RE = re.compile(r"^=== ", re.MULTILINE)
+# Headers without a prefix are also recognized for existing logs.
 
 
 def extract_latest_log_entry(text: str) -> str:
@@ -139,7 +140,7 @@ def extract_latest_log_entry(text: str) -> str:
     If there is no header (log empty or pre-header content), the
     full text is returned as-is so callers degrade gracefully.
     """
-    matches = list(_RUN_HEADER_RE.finditer(text))
+    matches = list(crony.log.RUN_HEADER_RE.finditer(text))
     if not matches:
         return text
     return text[matches[-1].start() :]

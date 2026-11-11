@@ -46,7 +46,10 @@ DEFAULT_BUNDLE_NAME: str = "default"
 # rejected).
 NOTIFY_INHERIT_TOKEN: str = DEFAULT_BUNDLE_NAME
 
-DEFAULT_NETWORK_CHECK_HTTPS: tuple[str, ...] = ("cloudflare.com", "google.com")
+DEFAULT_NETWORK_CHECK_HTTPS: tuple[str, ...] = (
+    "www.cloudflare.com",
+    "www.google.com",
+)
 
 
 # =============================================================================
@@ -176,7 +179,8 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
     ),
     JobFlags.NETWORK_REQUIRED: (
         "Cancel the run before executing its command when none of the "
-        "bundle's network-check-https hosts responds over verified HTTPS."
+        "bundle's network-check-https hosts returns HTTP 200 over "
+        "verified HTTPS."
     ),
 }
 

@@ -46,7 +46,7 @@
 #notify-success-ratio = "1/1"        # failure-notification floor (see below)
 #job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
 #start-timeout-sec    = 15           # `crony start --wait` deadline
-#network-check-https  = ["cloudflare.com", "google.com"]
+#network-check-https  = ["www.cloudflare.com", "www.google.com"]
 #priority             = "high"       # priority class; jobs may override
 #keep-awake           = true         # default; jobs may override
 # Optional: capabilities can also be set as a cascading list --
@@ -71,10 +71,10 @@
 # nonempty hostnames without schemes, ports, or paths, and cannot be [].
 #
 # After the gate and any interactive wait, crony tries an HTTPS HEAD
-# request to each host in order until one responds. Any HTTP status over
-# certificate-verified HTTPS is sufficient; redirects are not followed.
+# request to each host in order until one returns HTTP 200 over
+# certificate-verified HTTPS; redirects are not followed.
 # Socket operations have a five-second timeout; DNS uses the OS resolver's
-# timeouts. If every host fails (DNS, connection, TLS, or HTTP protocol),
+# timeouts. If every host fails or returns a status other than HTTP 200,
 # the command is skipped and the run is canceled without notification.
 # A daemon stays stopped, like a failed gate, until its next external
 # start (login, start, apply, or enable).

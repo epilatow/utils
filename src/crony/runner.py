@@ -37,9 +37,12 @@ from typing import (
     get_args,
 )
 
+import pydantic
+
 import crony.config
 import crony.errors
 import crony.launch
+import crony.log
 import crony.model
 import crony.network
 import crony.notify
@@ -387,19 +390,62 @@ def _signal_label(sig: int) -> str:
 
 
 def _write_crony_line(log_file: IO[bytes], log_path: Path, text: str) -> None:
-    """Append `crony: <text>` to the run log as crony's own line. When
-    the log's last byte is not a newline -- a killed command's output is
-    cut off wherever the kill caught it -- start a fresh line first, so
-    the note is not glued onto the tail of the command's output.
-    `log_file` is the append-mode handle the command wrote through, open
-    for writing only, so that last byte is read back through `log_path`.
+    """Append crony's message on its own prefixed lines."""
+    crony.log.write_line(log_file, text, log_path=log_path)
+
+
+@dataclasses.dataclass(frozen=True)
+class _LogFooter:
+    rc: int
+    signal: int | None
+    started: float
+
+
+_LOG_FOOTER_ADAPTER = pydantic.TypeAdapter(_LogFooter)
+
+
+def _footer_path(state_dir: Path, guard_pid: int) -> Path:
+    """Scope a runner's pending footer to the guard that will finish it."""
+    return state_dir / f"log-footer-{guard_pid}.json"
+
+
+def _write_exit_status(
+    log_file: IO[bytes],
+    log_path: Path,
+    rc: int,
+    sig: int | None,
+    started: float,
+    *,
+    defer_to_guard: bool = True,
+) -> None:
+    """Finish an unguarded log, or hand its footer to the owning guard.
+
+    The guard writes after reaping descendants: a background command can
+    emit output while being stopped, even after the runner has exited.
     """
-    lead = b""
-    with open(log_path, "rb") as reader:
-        if reader.seek(0, os.SEEK_END) > 0:
-            reader.seek(-1, os.SEEK_END)
-            lead = b"" if reader.read(1) == b"\n" else b"\n"
-    log_file.write(lead + f"crony: {text}\n".encode())
+    guard_pid = os.environ.get(crony.runtime.GUARD_PID_ENV)
+    if defer_to_guard and guard_pid is not None:
+        footer = _LogFooter(rc, sig, started)
+        _footer_path(log_path.parent, int(guard_pid)).write_bytes(
+            _LOG_FOOTER_ADAPTER.dump_json(footer)
+        )
+        return
+    elapsed = max(0, int(time.time() - started))
+    hours, remainder = divmod(elapsed, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    suffix = ""
+    if sig is not None:
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = str(sig)
+        suffix = f" (signal: {name})"
+    _write_crony_line(
+        log_file,
+        log_path,
+        f"exit status: {rc}{suffix}; "
+        f"runtime: {hours:02d}:{minutes:02d}:{seconds:02d}",
+    )
 
 
 def _arm_guard() -> None:
@@ -560,39 +606,50 @@ def _interactive_wait_and_prompt(
     """
 
     sd = snap.state_dir
+    log_path = snap.log_path_resolved
 
     def _bypass() -> bool:
         return crony.runtime.consume_user_start_flag(sd)
 
     while True:
-        log_file.write(
-            (
-                f"interactive: waiting for "
-                f"{snap.interactive_active_sec}s continuous active "
-                f"input\n"
-            ).encode()
+        _write_crony_line(
+            log_file,
+            log_path,
+            f"interactive: waiting for "
+            f"{snap.interactive_active_sec}s continuous active input",
         )
         if not _wait_for_user_active(
             snap.interactive_active_sec, bypass_check=_bypass
         ):
-            log_file.write(b"interactive: bypass (user-started during wait)\n")
+            _write_crony_line(
+                log_file,
+                log_path,
+                "interactive: bypass (user-started during wait)",
+            )
             return _InteractiveChoice.RUN
-        log_file.write(b"interactive: prompting user\n")
+        _write_crony_line(log_file, log_path, "interactive: prompting user")
         choice = _show_interactive_dialog(
             str(snap.entity_name),
             f"crony wants to run '{snap.entity_name}'. Now?",
         )
-        log_file.write(f"interactive: user chose {choice}\n".encode())
+        _write_crony_line(
+            log_file, log_path, f"interactive: user chose {choice}"
+        )
         if choice in (_InteractiveChoice.RUN, _InteractiveChoice.CANCEL):
             return choice
-        log_file.write(
-            f"interactive: delaying for "
-            f"{snap.interactive_delay_sec}s\n".encode()
+        _write_crony_line(
+            log_file,
+            log_path,
+            f"interactive: delaying for {snap.interactive_delay_sec}s",
         )
         if not _delay_or_bypass(
             snap.interactive_delay_sec, bypass_check=_bypass
         ):
-            log_file.write(b"interactive: bypass (user-started during delay)\n")
+            _write_crony_line(
+                log_file,
+                log_path,
+                "interactive: bypass (user-started during delay)",
+            )
             return _InteractiveChoice.RUN
 
 
@@ -635,6 +692,7 @@ def _throttle_daemon_restart(
 
 def _record_canceled_job(
     snap: crony.model.Job,
+    log_file: IO[bytes],
     *,
     gate: crony.model.GateResult,
     started: float,
@@ -659,6 +717,7 @@ def _record_canceled_job(
         log_path=str(snap.log_path),
         notifications={},
     )
+    _write_exit_status(log_file, snap.log_path_resolved, 0, None, started)
     crony.runtime.write_last_run(
         snap.state_dir / "last-run.json", dataclasses.asdict(result)
     )
@@ -783,15 +842,18 @@ def _run_job(snap: crony.model.Job) -> int:
                 timeout_label = (
                     "none" if snap.timeout == 0 else f"{snap.timeout}s"
                 )
-                header = (
-                    f"\n=== {started_iso} {full_name} "
-                    f"timeout={timeout_label} pid={os.getpid()} ===\n"
-                ).encode()
-                log_file.write(header)
+                _write_crony_line(
+                    log_file,
+                    log_path,
+                    f"=== {started_iso} {full_name} "
+                    f"timeout={timeout_label} pid={os.getpid()} ===",
+                )
 
                 gate_cmd = _gate_argv(snap)
                 if gate_cmd is not None:
-                    log_file.write(f"gate: {shlex.join(gate_cmd)}\n".encode())
+                    _write_crony_line(
+                        log_file, log_path, f"gate: {shlex.join(gate_cmd)}"
+                    )
                     gate_rc: int
                     try:
                         gate_proc = subprocess.run(
@@ -824,8 +886,10 @@ def _run_job(snap: crony.model.Job) -> int:
                             # leaves the next explicit start with a fresh
                             # retry budget.
                             crony.runtime.clear_exit_history(sd)
-                        log_file.write(
-                            (f"gate exited {gate_rc}: skipping job\n").encode()
+                        _write_crony_line(
+                            log_file,
+                            log_path,
+                            f"gate exited {gate_rc}: skipping job",
                         )
                         result = crony.model.JobRunResult(
                             host=crony.platform.current_host(),
@@ -841,6 +905,7 @@ def _run_job(snap: crony.model.Job) -> int:
                             log_path=str(snap.log_path),
                             notifications={},
                         )
+                        _write_exit_status(log_file, log_path, 0, None, started)
                         crony.runtime.write_last_run(
                             sd / "last-run.json", dataclasses.asdict(result)
                         )
@@ -877,7 +942,11 @@ def _run_job(snap: crony.model.Job) -> int:
                 if snap.interactive:
                     bypass = crony.runtime.consume_user_start_flag(sd)
                     if bypass:
-                        log_file.write(b"interactive: bypass (user-started)\n")
+                        _write_crony_line(
+                            log_file,
+                            log_path,
+                            "interactive: bypass (user-started)",
+                        )
                     else:
                         pending_flag = sd / "pending.flag"
                         pending_flag.write_bytes(b"")
@@ -890,6 +959,7 @@ def _run_job(snap: crony.model.Job) -> int:
                         if choice == _InteractiveChoice.CANCEL:
                             return _record_canceled_job(
                                 snap,
+                                log_file,
                                 gate=gate,
                                 started=started,
                                 started_iso=started_iso,
@@ -898,11 +968,12 @@ def _run_job(snap: crony.model.Job) -> int:
                 if (
                     crony.config.JobFlags.NETWORK_REQUIRED in snap.flags
                     and not crony.network.check_bundle_network(
-                        snap.bundle, log_file
+                        snap.bundle, log_file, log_path=log_path
                     )
                 ):
                     return _record_canceled_job(
                         snap,
+                        log_file,
                         gate=gate,
                         started=started,
                         started_iso=started_iso,
@@ -912,8 +983,10 @@ def _run_job(snap: crony.model.Job) -> int:
                 # held for the whole run, the FDA wrapper included.
                 argv, keep_awake_note = _keep_awake_argv(argv, snap)
                 if keep_awake_note is not None:
-                    log_file.write(f"{keep_awake_note}\n".encode())
-                log_file.write(f"exec: {shlex.join(argv)}\n".encode())
+                    _write_crony_line(log_file, log_path, keep_awake_note)
+                _write_crony_line(
+                    log_file, log_path, f"exec: {shlex.join(argv)}"
+                )
                 outcome, timed_out = _exec_command(
                     argv, env=env, log_file=log_file
                 )
@@ -997,6 +1070,7 @@ def _run_job(snap: crony.model.Job) -> int:
                     notify_channels=notify_channels,
                     notify_defaults=notify_defaults,
                     success_ratio=success_ratio,
+                    command_outcome=outcome,
                 )
             except _StopRequested as stop:
                 if stop.timed_out:
@@ -1039,9 +1113,18 @@ def _run_job(snap: crony.model.Job) -> int:
                 log_file.close()
     except crony.errors.LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
-            f.write(
+            _write_crony_line(
+                f,
+                log_path,
                 f"[{crony.runtime.now_iso()}] LOCK_BUSY: skipping "
-                f"(already running)\n".encode()
+                "(already running)",
+            )
+            _write_exit_status(
+                f,
+                log_path,
+                0 if is_daemon else int(crony.errors.ExitCode.LOCK_BUSY),
+                None,
+                started,
             )
         # For a daemon every non-zero exit asks the supervisor to restart,
         # so surfacing LOCK_BUSY would have it respawn against the runner
@@ -1109,6 +1192,7 @@ def _record_outcome(
     notify_channels: list[str],
     notify_defaults: crony.config.Defaults,
     success_ratio: crony.config.SuccessRatio,
+    command_outcome: _ExitOutcome | None = None,
 ) -> int:
     """Finish a job run that has an outcome of its own -- the command's, or
     a timeout before the command started: charge a daemon's retry budget,
@@ -1143,22 +1227,20 @@ def _record_outcome(
             surfaced_rc = 0
             if exit_class == crony.model.ExitClass.OK:
                 exit_class = crony.model.ExitClass.FAIL
-            log_file.write(
-                (
-                    "daemon: retry limit reached after "
-                    f"{premature_exits} premature exits; "
-                    "leaving stopped (the next login, or "
-                    "crony start / apply / enable, "
-                    "retries it)\n"
-                ).encode()
+            _write_crony_line(
+                log_file,
+                log_path,
+                "daemon: retry limit reached after "
+                f"{premature_exits} premature exits; "
+                "leaving stopped (the next login, or "
+                "crony start / apply / enable, retries it)",
             )
         else:
-            log_file.write(
-                (
-                    "daemon: requesting automatic retry "
-                    f"{premature_exits} of "
-                    f"{crony.config.DAEMON_RETRY_LIMIT}\n"
-                ).encode()
+            _write_crony_line(
+                log_file,
+                log_path,
+                "daemon: requesting automatic retry "
+                f"{premature_exits} of {crony.config.DAEMON_RETRY_LIMIT}",
             )
 
     # Pre-populate per-channel slots with sent=False so the dispatcher can
@@ -1208,11 +1290,25 @@ def _record_outcome(
     ):
         should_dispatch = False
         result.notify_suppressed = True
-        log_file.write(
-            f"notify: suppressed by notify-success-ratio "
-            f"{success_ratio}\n".encode()
+        _write_crony_line(
+            log_file,
+            log_path,
+            f"notify: suppressed by notify-success-ratio {success_ratio}",
         )
 
+    _write_exit_status(
+        log_file,
+        log_path,
+        (
+            128 + command_outcome.signal
+            if command_outcome.signal is not None
+            else command_outcome.rc
+        )
+        if command_outcome is not None
+        else surfaced_rc,
+        command_outcome.signal if command_outcome is not None else sig,
+        started,
+    )
     if should_dispatch:
         log_text = ""
         try:
@@ -1298,6 +1394,9 @@ def _record_pre_command_stop(
         gate=gate,
         log_path=str(snap.log_path),
         notifications={},
+    )
+    _write_exit_status(
+        log_file, snap.log_path_resolved, process_exit, signum, started
     )
     crony.runtime.write_last_run(
         sd / "last-run.json", dataclasses.asdict(result)
@@ -1469,11 +1568,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                         "none" if snap.timeout == 0 else f"{snap.timeout}s"
                     )
                     header = (
-                        f"\n=== {started_iso} group {full_name} "
+                        f"=== {started_iso} group {full_name} "
                         f"children={header_children} "
-                        f"timeout={timeout_label} pid={os.getpid()} ===\n"
-                    ).encode()
-                    log_file.write(header)
+                        f"timeout={timeout_label} pid={os.getpid()} ==="
+                    )
+                    _write_crony_line(log_file, log_path, header)
 
                     deadline = (
                         math.inf
@@ -1495,9 +1594,10 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             # run: skipping it is the group doing as it was
                             # told, not a failure to run it, so record it
                             # `gated` and move on without faulting the group.
-                            log_file.write(
-                                f"-> {child_full_name}: skipped "
-                                f"(disabled)\n".encode()
+                            _write_crony_line(
+                                log_file,
+                                log_path,
+                                f"-> {child_full_name}: skipped (disabled)",
                             )
                             children.append(
                                 crony.model.GroupChildResult(
@@ -1513,11 +1613,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             # the user-active wait + dialog independently;
                             # the parent group's outcome doesn't depend on
                             # whether the user ever clicked Run Job.
-                            log_file.write(
-                                (
-                                    f"-> {child_full_name}: dispatched "
-                                    f"(interactive, async)\n"
-                                ).encode()
+                            _write_crony_line(
+                                log_file,
+                                log_path,
+                                f"-> {child_full_name}: dispatched "
+                                "(interactive, async)",
                             )
                             try:
                                 start_unit(
@@ -1533,7 +1633,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                                 )
                             except _CHILD_NOT_RUN as e:
                                 # The group could not run this child at all.
-                                log_file.write(f"   {e}\n".encode())
+                                _write_crony_line(log_file, log_path, f"   {e}")
                                 faults.append(crony.model.ExitClass.FAIL)
                                 children.append(
                                     crony.model.GroupChildResult(
@@ -1549,11 +1649,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             # The group's own budget ran out before it got to
                             # this child, so the child never ran: the group's
                             # fault, not the child's.
-                            log_file.write(
-                                (
-                                    f"-> {child_full_name}: TIMEOUT "
-                                    f"(group budget exhausted)\n"
-                                ).encode()
+                            _write_crony_line(
+                                log_file,
+                                log_path,
+                                f"-> {child_full_name}: TIMEOUT "
+                                "(group budget exhausted)",
                             )
                             faults.append(crony.model.ExitClass.TIMEOUT)
                             children.append(
@@ -1581,11 +1681,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             if math.isinf(remaining)
                             else f"{remaining:.0f}s"
                         )
-                        log_file.write(
-                            (
-                                f"-> {child_full_name} (timeout={cap_label}, "
-                                f"budget-left={budget_label})\n"
-                            ).encode()
+                        _write_crony_line(
+                            log_file,
+                            log_path,
+                            f"-> {child_full_name} (timeout={cap_label}, "
+                            f"budget-left={budget_label})",
                         )
                         try:
                             # The child's own cap and the group's remaining
@@ -1606,7 +1706,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             # crash is the child's outcome -- its own row says
                             # `crashed`, reached independently by reconciling
                             # its stale pid -- and never a fault of the group.
-                            log_file.write(f"   {e}\n".encode())
+                            _write_crony_line(log_file, log_path, f"   {e}")
                             children.append(
                                 crony.model.GroupChildResult(
                                     name=child_full_name,
@@ -1619,7 +1719,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             # No runner ever appeared, so the child never ran:
                             # the group failed to run it. Caught before the
                             # JobTimeoutError arm below -- it is a subclass.
-                            log_file.write(f"   {e}\n".encode())
+                            _write_crony_line(log_file, log_path, f"   {e}")
                             faults.append(crony.model.ExitClass.TIMEOUT)
                             children.append(
                                 crony.model.GroupChildResult(
@@ -1642,7 +1742,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             # was starved of its turn (a budget that starves one
                             # faults the group on the `remaining <= 0` path
                             # above, before dispatch).
-                            log_file.write(f"   {e}\n".encode())
+                            _write_crony_line(log_file, log_path, f"   {e}")
                             children.append(
                                 crony.model.GroupChildResult(
                                     name=child_full_name,
@@ -1655,7 +1755,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             continue
                         except _CHILD_NOT_RUN as e:
                             # The group could not run this child at all.
-                            log_file.write(f"   {e}\n".encode())
+                            _write_crony_line(log_file, log_path, f"   {e}")
                             faults.append(crony.model.ExitClass.FAIL)
                             children.append(
                                 crony.model.GroupChildResult(
@@ -1670,8 +1770,10 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             or crony.model.ExitClass.FAIL
                         )
                         rc = start_exit_code(rec)
-                        log_file.write(
-                            f"   finished: {cls} (exit {rc})\n".encode()
+                        _write_crony_line(
+                            log_file,
+                            log_path,
+                            f"   finished: {cls} (exit {rc})",
                         )
                         children.append(
                             crony.model.GroupChildResult(
@@ -1690,11 +1792,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                     for child_ref, resolved_name in resolved_children:
                         if resolved_name is None:
                             # Unresolvable child: the group could not run it.
-                            log_file.write(
-                                (
-                                    f"-> ref {child_ref}: "
-                                    f"no snapshot on this host (FAIL)\n"
-                                ).encode()
+                            _write_crony_line(
+                                log_file,
+                                log_path,
+                                f"-> ref {child_ref}: "
+                                "no snapshot on this host (FAIL)",
                             )
                             faults.append(crony.model.ExitClass.FAIL)
                             children.append(
@@ -1760,6 +1862,9 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                     log_path=str(reported_log_path),
                     jobs_run=children,
                 )
+                _write_exit_status(
+                    log_file, log_path, process_exit, stop_signal, started
+                )
                 crony.runtime.write_last_run(
                     last_run_path, dataclasses.asdict(result)
                 )
@@ -1768,9 +1873,14 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                 log_file.close()
     except crony.errors.LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
-            f.write(
+            _write_crony_line(
+                f,
+                log_path,
                 f"[{crony.runtime.now_iso()}] LOCK_BUSY: skipping "
-                f"(already running)\n".encode()
+                "(already running)",
+            )
+            _write_exit_status(
+                f, log_path, int(crony.errors.ExitCode.LOCK_BUSY), None, started
             )
         return int(crony.errors.ExitCode.LOCK_BUSY)
 
@@ -2413,6 +2523,62 @@ def _killed_run_exit(
     return rc
 
 
+def _log_unrecorded_exit(
+    sd: Path | None, launch_pid: int | None, rc: int, started: float
+) -> None:
+    """Finish the log when this guard's runner died before recording.
+
+    A lock-busy launch leaves the other runner's pid in place and writes
+    its own footer. Only a newly published pid belongs to this guard.
+    """
+    if sd is None or _run_recorded(sd, launch_pid):
+        return
+    pid = _read_runner_pid(sd)
+    if pid is None or pid == launch_pid:
+        return
+    path = sd / crony.model.RUN_LOG_NAME
+    with (
+        contextlib.suppress(OSError),
+        open(path, "ab", buffering=0) as log_file,
+    ):
+        _write_crony_line(
+            log_file, path, "runner exited without recording a result"
+        )
+        _write_exit_status(
+            log_file,
+            path,
+            rc if rc >= 0 else 128 - rc,
+            -rc if rc < 0 else None,
+            started,
+            defer_to_guard=False,
+        )
+
+
+def _finish_guard_log(
+    sd: Path | None, launch_pid: int | None, rc: int, started: float
+) -> None:
+    """Write the runner's footer after all session writers have exited."""
+    if sd is None:
+        return
+    pending = _footer_path(sd, os.getpid())
+    try:
+        footer = _LOG_FOOTER_ADAPTER.validate_json(pending.read_bytes())
+    except OSError, pydantic.ValidationError:
+        _log_unrecorded_exit(sd, launch_pid, rc, started)
+        return
+    path = sd / crony.model.RUN_LOG_NAME
+    with open(path, "ab", buffering=0) as log_file:
+        _write_exit_status(
+            log_file,
+            path,
+            footer.rc,
+            footer.signal,
+            footer.started,
+            defer_to_guard=False,
+        )
+    pending.unlink(missing_ok=True)
+
+
 def _await_wakeup(wake_r: int, timeout: float | None) -> None:
     """Sleep until a signal the guard handles arrives, or until `timeout`
     seconds pass (None for no limit), then empty the wakeup pipe.
@@ -2500,6 +2666,9 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     # runs, so it is the only way to tell a pid this run published from the
     # leftover of an earlier one (`_run_recorded`).
     launch_pid = _read_runner_pid(sd)
+    started = time.time()
+    if sd is not None:
+        _footer_path(sd, os.getpid()).unlink(missing_ok=True)
     pgid: int | None = None
     stop_signum: int | None = None
     deadline: float | None = None
@@ -2565,6 +2734,8 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             _reap_session(
                 proc, pgid, sd, timed_out=False, launch_pid=launch_pid
             )
+            assert proc.returncode is not None
+            _finish_guard_log(sd, launch_pid, proc.returncode, started)
             raise SystemExit(
                 _killed_run_exit(
                     proc,
@@ -2578,6 +2749,8 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, signal.SIGTERM)
             _reap_session(proc, pgid, sd, timed_out=True, launch_pid=launch_pid)
+            assert proc.returncode is not None
+            _finish_guard_log(sd, launch_pid, proc.returncode, started)
             raise SystemExit(
                 _killed_run_exit(
                     proc,
@@ -2605,6 +2778,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             _reap_session(
                 proc, pgid, sd, timed_out=False, launch_pid=launch_pid
             )
+        _finish_guard_log(sd, launch_pid, rc, started)
         raise SystemExit(rc if rc >= 0 else 128 - rc)
 
 
@@ -2635,6 +2809,7 @@ def do_run(ref: str) -> None:
     keeps its outcome and reason visible instead of leaving an earlier
     run's result in place.
     """
+    started = time.time()
     parsed = crony.unit.EntityRef.from_str(ref)
     if parsed is None:
         raise crony.errors.UsageError(
@@ -2673,7 +2848,7 @@ def do_run(ref: str) -> None:
             except crony.errors.LockBusyError:
                 daemon_exhausted = False
         _record_precondition_cancel(
-            parsed, exc, daemon_exhausted=daemon_exhausted
+            parsed, exc, daemon_exhausted=daemon_exhausted, started=started
         )
         if daemon_exhausted:
             raise SystemExit(0) from None
@@ -2686,6 +2861,7 @@ def _record_precondition_cancel(
     exc: crony.errors.PreconditionError,
     *,
     daemon_exhausted: bool = False,
+    started: float | None = None,
 ) -> None:
     """Write a minimal `last-run.json` recording a precondition
     failure as `canceled` so it surfaces in `crony status` -- same
@@ -2743,7 +2919,6 @@ def _record_precondition_cancel(
         "pid": os.getpid(),
         "reason": str(exc),
     }
-    crony.runtime.write_last_run(state_dir / "last-run.json", payload)
     log_path = state_dir / crony.model.RUN_LOG_NAME
     verdict = "FAILED" if daemon_exhausted else "CANCELED"
     suffix = (
@@ -2751,9 +2926,17 @@ def _record_precondition_cancel(
         if daemon_exhausted
         else ""
     )
-    line = f"\n=== {now} {verdict} {ref} ===\n   {exc}{suffix}\n"
-    with open(log_path, "ab") as f:
-        f.write(line.encode("utf-8"))
+    line = f"=== {now} {verdict} {ref} ===\n   {exc}{suffix}"
+    with open(log_path, "ab", buffering=0) as f:
+        _write_crony_line(f, log_path, line)
+        _write_exit_status(
+            f,
+            log_path,
+            process_exit,
+            None,
+            time.time() if started is None else started,
+        )
+    crony.runtime.write_last_run(state_dir / "last-run.json", payload)
 
 
 def do_jitter(ref: str, name: str) -> None:
@@ -2824,6 +3007,7 @@ def _append_jitter_log(state_dir: Path, name: str, *, succeeded: bool) -> None:
     run's output block."""
     now = crony.runtime.now_iso()
     outcome = "started" if succeeded else "start FAILED"
-    line = f"\n=== {now} JITTER {name} {outcome} ===\n"
-    with open(state_dir / crony.model.RUN_LOG_NAME, "ab") as f:
-        f.write(line.encode("utf-8"))
+    line = f"=== {now} JITTER {name} {outcome} ==="
+    log_path = state_dir / crony.model.RUN_LOG_NAME
+    with open(log_path, "ab", buffering=0) as f:
+        _write_crony_line(f, log_path, line)

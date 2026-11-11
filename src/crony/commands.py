@@ -32,6 +32,7 @@ import tomlkit.exceptions
 
 import crony.config
 import crony.errors
+import crony.log
 import crony.model
 import crony.notify
 import crony.paths
@@ -3192,11 +3193,10 @@ def parse_since_arg(value: str) -> datetime.datetime:
 
 def _filter_since(text: str, cutoff: datetime.datetime) -> str:
     """Drop log content older than --since by run-header timestamp."""
-    header_re = re.compile(r"^=== (\S+) ")
     keep_from: int | None = None
     lines = text.splitlines(keepends=True)
     for idx, line in enumerate(lines):
-        m = header_re.match(line)
+        m = crony.log.RUN_HEADER_RE.match(line)
         if not m:
             continue
         try:

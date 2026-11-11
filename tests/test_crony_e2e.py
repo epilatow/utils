@@ -176,6 +176,7 @@ class _CronyE2E:
         self.config_file.write_text("# crony e2e (empty base bundle)\n")
         self.crony_bin: Path | None = None
         self.env = os.environ.copy()
+        self.env.pop("CRONY_GUARD_PID", None)
         self.env["CRONY_CONFIG_DIR"] = str(self.config_dir)
         self.env["CRONY_CONFIG_FILE"] = str(self.config_file)
         self.env["CRONY_CONFIG_DROPIN_DIR"] = str(self.dropin_dir)
@@ -572,9 +573,21 @@ class TestApplyLifecycle:
         e2e.crony("apply", full)
         e2e.crony("start", "--sync", full)
         e2e.wait_for_recorded_status(full, "canceled")
+        e2e.wait_until(
+            lambda: (
+                "> crony: exit status: "
+                in _read_text(e2e.state_dir / E2E_BUNDLE / "probe" / "run.log")
+            ),
+            timeout=15,
+            what="final log footer",
+        )
         log = (e2e.state_dir / E2E_BUNDLE / "probe" / "run.log").read_text()
         assert "https://crony-check.invalid/ failed:" in log
         assert "exec:" not in log
+        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 0; runtime: "
+        )
 
     @pytest.mark.parametrize("daemon", [False, True])
     def test_initial_disabled_survives_enable_and_reapply(
@@ -664,6 +677,18 @@ class TestApplyLifecycle:
         assert job_path == f"/job-extra:{before}"
         assert marker == ""
         assert saved_path == ""
+        e2e.wait_until(
+            lambda: (
+                "> crony: exit status: "
+                in _read_text(e2e.state_dir / E2E_BUNDLE / "probe" / "run.log")
+            ),
+            timeout=15,
+            what="final log footer",
+        )
+        log = (e2e.state_dir / E2E_BUNDLE / "probe" / "run.log").read_text()
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 0; runtime: "
+        )
 
     def test_destroy_removes_deployment(self, e2e: _CronyE2E) -> None:
         e2e.write_bundle(

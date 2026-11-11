@@ -30,8 +30,8 @@ _script_path = REPO_ROOT / "src" / "crony" / "network.py"
 
 
 class TestNetworkCheck:
-    @pytest.mark.parametrize("status", [200, 301, 403, 405, 503])
-    def test_any_verified_http_response_is_enough(
+    @pytest.mark.parametrize("status", [200, 204, 301, 403, 405, 503])
+    def test_only_http_200_is_enough(
         self, status: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -42,14 +42,33 @@ class TestNetworkCheck:
         ) as connection:
             conn = connection.return_value
             conn.getresponse.return_value.__enter__.return_value.status = status
-            assert network.check_bundle_network("default", log)
+            assert network.check_bundle_network("default", log) == (
+                status == 200
+            )
             # The default HTTPSConnection context verifies the certificate
             # and hostname. No context override or insecure fallback is used.
-            connection.assert_called_once_with("cloudflare.com", timeout=5)
-            conn.request.assert_called_once_with("HEAD", "/")
-            conn.close.assert_called_once_with()
-            conn.getresponse.return_value.__exit__.assert_called_once()
+            assert connection.call_args_list == [
+                mock.call(host, timeout=5)
+                for host in (
+                    ["www.cloudflare.com"]
+                    if status == 200
+                    else ["www.cloudflare.com", "www.google.com"]
+                )
+            ]
+            assert (
+                conn.request.call_args_list
+                == [mock.call("HEAD", "/")] * connection.call_count
+            )
+            assert conn.close.call_count == connection.call_count
+            assert (
+                conn.getresponse.return_value.__exit__.call_count
+                == connection.call_count
+            )
         assert f"HTTP {status}".encode() in log.getvalue()
+        assert all(
+            line.startswith(b"> crony: ")
+            for line in log.getvalue().splitlines()
+        )
 
     @pytest.mark.parametrize(
         "error",
@@ -78,8 +97,8 @@ class TestNetworkCheck:
             getattr(conn, stage).side_effect = error
             assert not network.check_bundle_network("missing", log)
             assert connection.call_args_list == [
-                mock.call("cloudflare.com", timeout=5),
-                mock.call("google.com", timeout=5),
+                mock.call("www.cloudflare.com", timeout=5),
+                mock.call("www.google.com", timeout=5),
             ]
             assert conn.close.call_count == 2
         assert b"canceling job" in log.getvalue()
@@ -97,6 +116,21 @@ class TestNetworkCheck:
             assert network.check_bundle_network("default", io.BytesIO())
             assert connection.call_count == 2
 
+    def test_redirect_falls_through_to_second_host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _RunnerHarness(tmp_path, monkeypatch)
+        with mock.patch.object(
+            http.client, "HTTPSConnection", autospec=True
+        ) as connection:
+            response = connection.return_value.getresponse.return_value
+            response.__enter__.side_effect = [
+                mock.Mock(status=301),
+                mock.Mock(status=200),
+            ]
+            assert network.check_bundle_network("default", io.BytesIO())
+            assert connection.call_count == 2
+
     def test_live_bundle_hosts_without_default_bundle_inheritance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -110,8 +144,10 @@ class TestNetworkCheck:
         with mock.patch.object(
             http.client, "HTTPSConnection", autospec=True
         ) as connection:
+            conn = connection.return_value
+            conn.getresponse.return_value.__enter__.return_value.status = 200
             assert network.check_bundle_network("backup", io.BytesIO())
-            connection.assert_called_once_with("cloudflare.com", timeout=5)
+            connection.assert_called_once_with("www.cloudflare.com", timeout=5)
             connection.reset_mock()
             bundle.write_text(
                 '[defaults]\nnetwork-check-https = ["backup.example."]\n',
@@ -135,8 +171,10 @@ class TestNetworkCheck:
                 http.client, "HTTPSConnection", autospec=True
             ) as connection,
         ):
+            conn = connection.return_value
+            conn.getresponse.return_value.__enter__.return_value.status = 200
             assert network.check_bundle_network("backup", io.BytesIO())
-            connection.assert_called_once_with("cloudflare.com", timeout=5)
+            connection.assert_called_once_with("www.cloudflare.com", timeout=5)
 
 
 if __name__ == "__main__":

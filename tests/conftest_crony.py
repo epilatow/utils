@@ -137,6 +137,8 @@ def isolate_crony_home(
     layers cleanly atop this fixture.
     """
     sentinel = tmp_path / "_home_sentinel_unwritten"
+    # In-process runners must not signal or defer logging to a host guard.
+    monkeypatch.delenv(crony_runtime.GUARD_PID_ENV, raising=False)
     # The scheduler backends resolve their unit directory under
     # Path.home(), so patching it sandboxes those too -- no separate
     # redirect needed.

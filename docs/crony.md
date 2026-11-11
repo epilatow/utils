@@ -256,7 +256,12 @@ pending (config) value by default, or the applied value under --config-current
 
 ### `logs [-n N] [-s SINCE] [-t | -l] [-p] job`
 
-Print a job's recent log output.
+Crony's own log lines start with '> crony: '. Command output is preserved as
+written. Each completed run ends with its exit status, an optional terminating
+signal, and runtime (HH:MM:SS). A command's exit status is its actual code,
+including configured success codes, or 128 + the signal number. Runs skipped
+before the command starts report crony's exit status. Runtime includes gates
+and interactive waits.
 
 - **`-n N`**\
   Print the last N lines (default: 200, or 10 with --tail).
@@ -484,7 +489,7 @@ Send a synthetic failure notification.
   initial setting again.
 - **`network-required`**\
   Cancel the run before executing its command when none of the bundle's
-  network-check-https hosts responds over verified HTTPS.
+  network-check-https hosts returns HTTP 200 over verified HTTPS.
 
 ### MASKED values
 

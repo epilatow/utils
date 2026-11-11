@@ -1343,15 +1343,16 @@ class TestLogHelpers:
     conditions so a regression in a helper surfaces here first.
     """
 
-    def test_extract_returns_from_last_header(self) -> None:
+    @pytest.mark.parametrize("prefix", ["", "> crony: "])
+    def test_extract_returns_from_last_header(self, prefix: str) -> None:
         text = (
             "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
             "older\n"
-            "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
+            f"{prefix}=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             "newest\n"
         )
         out = crony_notify.extract_latest_log_entry(text)
-        assert out.startswith("=== 2026-05-02T03:00:00-08:00")
+        assert out.startswith(f"{prefix}=== 2026-05-02T03:00:00-08:00")
         assert "newest" in out
         assert "older" not in out
 

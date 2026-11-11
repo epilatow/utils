@@ -397,6 +397,8 @@ class TestNetworkRequired:
         with mock.patch(
             "http.client.HTTPSConnection", autospec=True
         ) as connection:
+            conn = connection.return_value
+            conn.getresponse.return_value.__enter__.return_value.status = 200
             with pytest.raises(SystemExit) as exc:
                 crony_runner.do_run(h.ref("j"))
             assert exc.value.code == 0
@@ -443,6 +445,10 @@ class TestNetworkRequired:
         )
         assert rc == (
             int(ExitCode.DAEMON_EXITED) if daemon and available else 0
+        )
+        log = (h.state_dir("j") / "run.log").read_text()
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 0; runtime: "
         )
         if not available:
             assert h.last_run("j")["notifications"] == {}
@@ -630,6 +636,11 @@ class TestRunJobBasics:
         assert "schema 999" in rec["reason"]
         # run.log gained the canceled entry too.
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
+        log = (sd / "run.log").read_text(encoding="utf-8")
+        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.splitlines()[-1].startswith(
+            f"> crony: exit status: {int(ExitCode.PRECONDITION)}; runtime: "
+        )
 
     def test_run_skips_last_run_write_when_state_dir_missing(
         self, tmp_path: Path, monkeypatch: Any
@@ -761,6 +772,9 @@ class TestRunJobBasics:
         log_text = (h.state_dir("d", cfg=cfg) / "run.log").read_text()
         assert "FAILED" in log_text
         assert "daemon retry limit reached" in log_text
+        assert log_text.splitlines()[-1].startswith(
+            "> crony: exit status: 0; runtime: "
+        )
 
     def test_daemon_precondition_does_not_count_against_a_live_run(
         self, tmp_path: Path, monkeypatch: Any
@@ -1035,6 +1049,10 @@ class TestRunJobGate:
         log = (sd / "run.log").read_text(encoding="utf-8")
         assert "skipping job" in log
         assert "exec:" not in log
+        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 0; runtime: "
+        )
 
     @pytest.mark.parametrize("script_exists", [False, True])
     @pytest.mark.parametrize("gate", [None, "true"])
@@ -1469,6 +1487,10 @@ class TestRunGroup:
         assert "timeout=" in log
         assert "pid=" in log
         assert f"group {h.full('g')} " in log
+        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 0; runtime: "
+        )
 
     def test_clean_group_run_leaves_run_pid(
         self, tmp_path: Path, monkeypatch: Any
@@ -2807,6 +2829,9 @@ class TestRunJobKilled:
         assert (
             "crony: command exceeded the 1800s timeout and was killed\n" in log
         )
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 143 (signal: SIGTERM); runtime: "
+        )
 
     def test_run_job_logs_a_signal_death(
         self, tmp_path: Path, monkeypatch: Any
@@ -2832,6 +2857,9 @@ class TestRunJobKilled:
         assert rec["exit_class"] == "signal"
         log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
         assert "crony: command was killed by SIGTERM (15)\n" in log
+        assert log.splitlines()[-1].startswith(
+            "> crony: exit status: 143 (signal: SIGTERM); runtime: "
+        )
 
     def test_run_job_crony_line_starts_fresh_after_partial_output(
         self, tmp_path: Path, monkeypatch: Any
@@ -2854,39 +2882,172 @@ class TestRunJobKilled:
         snap = h.snap(cfg, "j")
         crony_runner._run_job(snap)
         log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
-        assert "progress 42%\ncrony: command exceeded" in log
+        assert "progress 42%\n> crony: command exceeded" in log
 
         tail["bytes"] = b"done\n"
         crony_runner._run_job(snap)
         log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
-        assert "done\ncrony: command exceeded" in log
-        assert "done\n\ncrony:" not in log
+        assert "done\n> crony: command exceeded" in log
+        assert "done\n\n> crony:" not in log
 
-    def test_run_job_ok_writes_no_crony_line(
-        self, tmp_path: Path, monkeypatch: Any
+    @pytest.mark.parametrize(
+        ("rc", "success_codes", "surfaced"),
+        [(0, [], 0), (42, [], 42), (42, [42], 0)],
+    )
+    @pytest.mark.parametrize(
+        ("elapsed", "runtime"),
+        [(5, "00:00:05"), (3661, "01:01:01"), (90061, "25:01:01")],
+    )
+    def test_run_job_logs_actual_status_and_runtime(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        rc: int,
+        success_codes: list[int],
+        surfaced: int,
+        elapsed: int,
+        runtime: str,
     ) -> None:
-        # A clean exit gets no verdict line: the log of a healthy run is
-        # the header, the exec line, and the command's own output.
         h = _RunnerHarness(tmp_path, monkeypatch)
+        clock = [100.0]
 
-        def fake_exec(*_args: object, **_kwargs: object) -> Any:
-            return crony_runner._ExitOutcome(rc=0, signal=None), False
+        def fake_exec(*_args: object, **kwargs: Any) -> Any:
+            kwargs["log_file"].write(b"command output without a newline")
+            clock[0] += elapsed
+            return crony_runner._ExitOutcome(rc=rc, signal=None), False
 
         monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
+        monkeypatch.setattr(time, "time", lambda: clock[0])
         cfg = h.config(
-            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "success-exit-codes": success_codes,
+                    }
+                }
+            },
             default_target_jobs=["j"],
         )
         snap = h.snap(cfg, "j")
-        assert crony_runner._run_job(snap) == 0
+        assert crony_runner._run_job(snap) == surfaced
         log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
-        assert "crony:" not in log
+        lines = log.splitlines()
+        assert lines[-2] == "command output without a newline"
+        assert lines[-1] == (f"> crony: exit status: {rc}; runtime: {runtime}")
+        assert all(line.startswith("> crony: ") for line in lines[:-2])
 
     def test_signal_label_names_known_signals_only(self) -> None:
         assert crony_runner._signal_label(15) == "SIGTERM (15)"
         assert crony_runner._signal_label(9) == "SIGKILL (9)"
         # A number the platform does not name still renders.
         assert crony_runner._signal_label(250) == "signal 250"
+
+
+class TestUnrecordedExitLog:
+    @pytest.mark.parametrize("rc", [42, -signal.SIGKILL])
+    def test_guard_logs_unrecorded_runner_exit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rc: int
+    ) -> None:
+        (tmp_path / "run.pid").write_text("123\n")
+        monkeypatch.setattr(time, "time", lambda: 105.0)
+        crony_runner._log_unrecorded_exit(tmp_path, 100, rc, 100.0)
+        log = (tmp_path / "run.log").read_text()
+        status = "137 (signal: SIGKILL)" if rc < 0 else "42"
+        assert log.endswith(
+            f"> crony: exit status: {status}; runtime: 00:00:05\n"
+        )
+
+    def test_guard_does_not_log_for_another_runner(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "run.pid").write_text("100\n")
+        crony_runner._log_unrecorded_exit(tmp_path, 100, 0, 100.0)
+        assert not (tmp_path / "run.log").exists()
+
+    def test_guard_does_not_duplicate_recorded_footer(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "run.pid").write_text("123\n")
+        (tmp_path / "last-run.json").write_text('{"pid": 123}')
+        crony_runner._log_unrecorded_exit(tmp_path, 100, 0, 100.0)
+        assert not (tmp_path / "run.log").exists()
+
+
+class TestGuardLogFooter:
+    @pytest.mark.parametrize(
+        ("command_status", "expected_code", "status"),
+        [
+            ("0", 0, "0"),
+            ("42", 42, "42"),
+            ("signal", 143, "143 (signal: SIGTERM)"),
+        ],
+    )
+    def test_footer_follows_descendant_cleanup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command_status: str,
+        expected_code: int,
+        status: str,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        script = REPO_ROOT / "tests" / "helpers" / "crony_cleanup.sh"
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "script": str(script),
+                        "args": [str(tmp_path / "ready"), command_status],
+                        "on-demand": True,
+                        "keep-awake": False,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.write_snap(cfg, "j")
+        entry = str(REPO_ROOT / "bin" / "crony")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                entry,
+                "_run-guard",
+                "30",
+                sys.executable,
+                entry,
+                "_run",
+                h.ref("j"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=45,
+        )
+        assert proc.returncode == expected_code, proc.stderr
+        log = (h.state_dir("j") / "run.log").read_text()
+        assert "child cleanup output\n" in log
+        assert log.splitlines()[-1].startswith(
+            f"> crony: exit status: {status}; runtime: "
+        )
+        assert log.count("> crony: exit status:") == 1
+        assert not list(h.state_dir("j").glob("log-footer-*.json"))
+
+    def test_guard_footer_is_deferred_and_scoped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "run.log"
+        path.write_bytes(b"command output")
+        monkeypatch.setenv(crony_runtime.GUARD_PID_ENV, str(os.getpid()))
+        monkeypatch.setattr(time, "time", lambda: 105.0)
+        with path.open("ab", buffering=0) as log:
+            crony_runner._write_exit_status(log, path, 0, None, 100.0)
+        assert path.read_bytes() == b"command output"
+        crony_runner._finish_guard_log(tmp_path, None, 0, 100.0)
+        assert path.read_text() == (
+            "command output\n> crony: exit status: 0; runtime: 00:00:05\n"
+        )
 
 
 _STOPS = pytest.mark.parametrize(
@@ -5792,6 +5953,10 @@ class TestUserStop:
         )
         assert code == (0 if disable else expected)
         assert h.last_run("j")["exit_class"] == "stopped"
+        footer = snap.log_path_resolved.read_text().splitlines()[-1]
+        assert footer.startswith(
+            f"> crony: exit status: {code} (signal: SIGTERM); runtime: "
+        )
         assert crony_runtime.read_exit_history(snap.state_dir).runs == []
 
     def test_disable_does_not_relabel_a_timeout(
@@ -5902,6 +6067,11 @@ class TestUserStop:
         ]
         assert dispatched == [h.full("a")]
         assert h.full("b") in (h.state_dir("g") / "run.log").read_text()
+        footer = (h.state_dir("g") / "run.log").read_text().splitlines()[-1]
+        code = int(ExitCode.TIMEOUT) if guard_timeout else 143
+        assert footer.startswith(
+            f"> crony: exit status: {code} (signal: SIGTERM); runtime: "
+        )
         assert not (h.state_dir("a") / "last-run.json").exists()
 
     def test_group_continues_after_a_child_is_stopped(

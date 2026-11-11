@@ -708,6 +708,15 @@ def _build_parser() -> StrictArgumentParser:
     p_logs = subparsers.add_parser(
         "logs",
         help="Print a job's recent log output.",
+        description=(
+            "Crony's own log lines start with '> crony: '. Command output\n"
+            "is preserved as written. Each completed run ends with its exit\n"
+            "status, an optional terminating signal, and runtime (HH:MM:SS).\n"
+            "A command's exit status is its actual code, including configured\n"
+            "success codes, or 128 + the signal number. Runs skipped before\n"
+            "the command starts report crony's exit status. Runtime includes\n"
+            "gates and interactive waits."
+        ),
         hidden_aliases=["log"],
     )
     p_logs.add_argument(

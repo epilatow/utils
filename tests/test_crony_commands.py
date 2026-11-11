@@ -6725,8 +6725,9 @@ class TestLogs:
         uuid_log = h.state_dir("j", ensure_snapshot=False) / "run.log"
         assert out == str(uuid_log)
 
+    @pytest.mark.parametrize("prefix", ["", "> crony: "])
     def test_since_filters_old_runs(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any, prefix: str
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
@@ -6743,7 +6744,7 @@ class TestLogs:
         )
         log.write_text(
             f"=== {old_iso} j pid=1 ===\nold-line\n"
-            f"=== {now_iso} j pid=2 ===\nnew-line\n",
+            f"{prefix}=== {now_iso} j pid=2 ===\nnew-line\n",
             encoding="utf-8",
         )
         crony_commands.do_logs(
