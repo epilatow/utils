@@ -584,7 +584,10 @@ class TestApplyLifecycle:
         log = (e2e.state_dir / E2E_BUNDLE / "probe" / "run.log").read_text()
         assert "https://crony-check.invalid/ failed:" in log
         assert "exec:" not in log
-        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.startswith("\n=== ")
+        assert all(
+            line.startswith("> crony: ") for line in log.splitlines()[2:]
+        )
         assert log.splitlines()[-1].startswith(
             "> crony: exit status: 0; runtime: "
         )

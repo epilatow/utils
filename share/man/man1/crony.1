@@ -234,7 +234,8 @@ Always exits 0 \-\- this is a filter on the display, not a gate.\&
 .RE
 .TP
 \f[B]logs\f[R] [\-n N] [\-s SINCE] [\-t | \-l] [\-p] job
-Crony\(aqs own log lines start with \(aq> crony: \(aq.\&
+Crony\(aqs diagnostic log lines start with \(aq> crony: \(aq.\&
+Run delimiters are unprefixed and follow a blank line.\&
 Command output is preserved as written.\&
 Each completed run ends with its exit status, an optional terminating signal, and runtime (HH:MM:SS).\&
 A command\(aqs exit status is its actual code, including configured success codes, or 128 + the signal number.\&

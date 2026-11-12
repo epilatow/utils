@@ -562,6 +562,7 @@ class TestRunJobBasics:
         )
         crony_runner._run_job(h.snap(cfg, "ok"))
         log = (h.state_dir("ok") / "run.log").read_text(encoding="utf-8")
+        assert log.startswith("\n=== ")
         assert f"{h.full('ok')} timeout=300s pid=" in log
 
     def test_command_failure_propagates_rc(
@@ -637,7 +638,10 @@ class TestRunJobBasics:
         # run.log gained the canceled entry too.
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
         log = (sd / "run.log").read_text(encoding="utf-8")
-        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.startswith("\n=== ")
+        assert all(
+            line.startswith("> crony: ") for line in log.splitlines()[2:]
+        )
         assert log.splitlines()[-1].startswith(
             f"> crony: exit status: {int(ExitCode.PRECONDITION)}; runtime: "
         )
@@ -1049,7 +1053,10 @@ class TestRunJobGate:
         log = (sd / "run.log").read_text(encoding="utf-8")
         assert "skipping job" in log
         assert "exec:" not in log
-        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.startswith("\n=== ")
+        assert all(
+            line.startswith("> crony: ") for line in log.splitlines()[2:]
+        )
         assert log.splitlines()[-1].startswith(
             "> crony: exit status: 0; runtime: "
         )
@@ -1487,7 +1494,10 @@ class TestRunGroup:
         assert "timeout=" in log
         assert "pid=" in log
         assert f"group {h.full('g')} " in log
-        assert all(line.startswith("> crony: ") for line in log.splitlines())
+        assert log.startswith("\n=== ")
+        assert all(
+            line.startswith("> crony: ") for line in log.splitlines()[2:]
+        )
         assert log.splitlines()[-1].startswith(
             "> crony: exit status: 0; runtime: "
         )
@@ -2936,7 +2946,9 @@ class TestRunJobKilled:
         lines = log.splitlines()
         assert lines[-2] == "command output without a newline"
         assert lines[-1] == (f"> crony: exit status: {rc}; runtime: {runtime}")
-        assert all(line.startswith("> crony: ") for line in lines[:-2])
+        assert lines[0] == ""
+        assert lines[1].startswith("=== ")
+        assert all(line.startswith("> crony: ") for line in lines[2:-2])
 
     def test_signal_label_names_known_signals_only(self) -> None:
         assert crony_runner._signal_label(15) == "SIGTERM (15)"
@@ -5377,6 +5389,7 @@ class TestDoJitter:
             ("deactivate_jitter", self._NAME),
         ]
         logged = (sd / RUN_LOG_NAME).read_text(encoding="utf-8")
+        assert logged.startswith("\n=== ")
         assert self._NAME in logged and "started" in logged
         assert "FAILED" not in logged
 

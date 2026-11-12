@@ -256,12 +256,13 @@ pending (config) value by default, or the applied value under --config-current
 
 ### `logs [-n N] [-s SINCE] [-t | -l] [-p] job`
 
-Crony's own log lines start with '> crony: '. Command output is preserved as
-written. Each completed run ends with its exit status, an optional terminating
-signal, and runtime (HH:MM:SS). A command's exit status is its actual code,
-including configured success codes, or 128 + the signal number. Runs skipped
-before the command starts report crony's exit status. Runtime includes gates
-and interactive waits.
+Crony's diagnostic log lines start with '> crony: '. Run delimiters are
+unprefixed and follow a blank line. Command output is preserved as written.
+Each completed run ends with its exit status, an optional terminating signal,
+and runtime (HH:MM:SS). A command's exit status is its actual code, including
+configured success codes, or 128 + the signal number. Runs skipped before the
+command starts report crony's exit status. Runtime includes gates and
+interactive waits.
 
 - **`-n N`**\
   Print the last N lines (default: 200, or 10 with --tail).

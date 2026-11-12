@@ -709,7 +709,9 @@ def _build_parser() -> StrictArgumentParser:
         "logs",
         help="Print a job's recent log output.",
         description=(
-            "Crony's own log lines start with '> crony: '. Command output\n"
+            "Crony's diagnostic log lines start with '> crony: '. Run\n"
+            "delimiters are unprefixed and follow a blank line. Command "
+            "output\n"
             "is preserved as written. Each completed run ends with its exit\n"
             "status, an optional terminating signal, and runtime (HH:MM:SS).\n"
             "A command's exit status is its actual code, including configured\n"

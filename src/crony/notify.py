@@ -119,9 +119,9 @@ def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
 
 # Each `crony _run` invocation writes a header line to run.log.
 # Two shapes:
-#   > crony: === <ISO ts> <full.name> pid=<N> ===
+#   === <ISO ts> <full.name> pid=<N> ===
 #       Ordinary run: name resolved, snapshot loaded, pid known.
-#   > crony: === <ISO ts> CANCELED <bundle>:<uuid> ===
+#   === <ISO ts> CANCELED <bundle>:<uuid> ===
 #       Snapshot couldn't be loaded (missing, unreadable, wrong
 #       schema, unknown kind). No pid; the line surfaces the
 #       cancel for `crony logs --latest`.
@@ -131,7 +131,7 @@ def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
 # the log-bearing notify transports, email and ntfy, each of which
 # inlines the slice under its own size budget rather than attaching
 # the whole file.
-# Headers without a prefix are also recognized for existing logs.
+# Prefixed headers are also recognized for existing logs.
 
 
 def extract_latest_log_entry(text: str) -> str:

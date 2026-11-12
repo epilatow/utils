@@ -842,11 +842,11 @@ def _run_job(snap: crony.model.Job) -> int:
                 timeout_label = (
                     "none" if snap.timeout == 0 else f"{snap.timeout}s"
                 )
-                _write_crony_line(
+                crony.log.write_header(
                     log_file,
-                    log_path,
                     f"=== {started_iso} {full_name} "
                     f"timeout={timeout_label} pid={os.getpid()} ===",
+                    log_path=log_path,
                 )
 
                 gate_cmd = _gate_argv(snap)
@@ -1572,7 +1572,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                         f"children={header_children} "
                         f"timeout={timeout_label} pid={os.getpid()} ==="
                     )
-                    _write_crony_line(log_file, log_path, header)
+                    crony.log.write_header(log_file, header, log_path=log_path)
 
                     deadline = (
                         math.inf
@@ -2926,9 +2926,11 @@ def _record_precondition_cancel(
         if daemon_exhausted
         else ""
     )
-    line = f"=== {now} {verdict} {ref} ===\n   {exc}{suffix}"
     with open(log_path, "ab", buffering=0) as f:
-        _write_crony_line(f, log_path, line)
+        crony.log.write_header(
+            f, f"=== {now} {verdict} {ref} ===", log_path=log_path
+        )
+        _write_crony_line(f, log_path, f"   {exc}{suffix}")
         _write_exit_status(
             f,
             log_path,
@@ -3010,4 +3012,4 @@ def _append_jitter_log(state_dir: Path, name: str, *, succeeded: bool) -> None:
     line = f"=== {now} JITTER {name} {outcome} ==="
     log_path = state_dir / crony.model.RUN_LOG_NAME
     with open(log_path, "ab", buffering=0) as f:
-        _write_crony_line(f, log_path, line)
+        crony.log.write_header(f, line, log_path=log_path)
