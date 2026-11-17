@@ -2766,8 +2766,9 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             continue
         if stop_signum is not None:
             # Handle a stop that arrived during the completion check at
-            # the same point as one received while waiting.
-            continue
+            # the same point as one received while waiting. Mypy does not
+            # model asynchronous signal handlers changing stop_signum.
+            continue  # type: ignore[unreachable]
         if _group_alive(pgid):
             # The run ended on its own and left something in its session.
             # An ordinary stop during this sweep is relayed by the handler

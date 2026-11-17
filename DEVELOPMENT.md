@@ -54,8 +54,8 @@ This repo is a personal-utilities collection. Top-level structure:
   prepends `<repo>/src` to `sys.path` -- via `Path(__file__).resolve()`, which
   follows any symlink to the real file so the repo-root walk is correct even
   when the entry is invoked through a symlink -- before importing `common`.
-  `[tool.mypy] mypy_path = ["src"]` in `pyproject.toml` lets the code-quality
-  gate's `mypy --strict` resolve these imports statically.
+  `[tool.mypy] mypy_path = ["src"]` in `pyproject.toml` lets the gate's
+  `mypy --strict --warn-unreachable` resolve these imports statically.
 
 - `src/<module>.py` alias symlinks -- each extension-less executable entry
   (under `bin/` or `scripts/`) has a matching `src/<module>.py` symlink

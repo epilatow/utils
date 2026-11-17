@@ -6,9 +6,8 @@ dependencies = [
     "epilatow-repo-shared",
     "pytest>=9.0.3",
     # crony's snapshot model. A real project dep (not just bin/crony's
-    # PEP 723 block) so the gate's `mypy --strict src/crony/*.py`, which
-    # runs in this project venv, resolves it -- unlike tomlkit, pydantic
-    # is not pulled in transitively.
+    # PEP 723 block) so the shared type checks in this project venv
+    # resolve it -- unlike tomlkit, pydantic is not pulled in transitively.
     # Python 3.15 support starts in Pydantic 2.14.
     "pydantic>=2.14",
 ]
@@ -18,7 +17,7 @@ epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = 
 
 [tool.mypy]
 # First-party shared packages live under src/ (e.g. `common`). The
-# code-quality gate runs `mypy --strict <file>` from the repo root, so
+# code-quality gate runs mypy from the repo root, so
 # mypy reads this config; mypy_path lets it resolve `import common`
 # statically (the entry scripts add src/ to sys.path at runtime, which
 # mypy does not execute).
