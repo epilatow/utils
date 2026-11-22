@@ -16,8 +16,10 @@ apply.
 ## Working in any repo
 
 - **Plan first.** Before making any changes, present a plan and wait for
-  explicit approval. If the task changes mid-work or a new design discussion
-  begins, stop making changes and return to planning.
+  explicit approval. For a complex change, the plan lists its commits; see
+  [Break complex changes into small commits](#break-complex-changes-into-small-commits).
+  If the task changes mid-work or a new design discussion begins, stop making
+  changes and return to planning.
 - **Test baseline before changes.** Check for any associated tests (e.g. test
   files in `tests/`) and run them to establish a baseline. Flag any
   pre-existing testing problems before implementing planned changes -- a broken
@@ -33,15 +35,17 @@ apply.
   remains available, follow the repository-local
   `.agents/skills/repo-shared-audit-committed-change/SKILL.md`. Fix findings in
   the owning commit and rerun the audit before testing. This implementer-owned
-  audit does not replace independent review.
+  audit does not replace independent review. A renames-only commit skips it;
+  see [Renames](#renames).
 - **A green implementer-owned gate precedes review.** After the
   authored-context audit, run repo-shared and focused checks relevant to the
   committed change, following [Testing](DEVELOPMENT_SHARED.md#testing). Use the
   repository-local `.agents/skills/repo-shared-run-commit-gates/SKILL.md` for
   that exact commit. Do not give a reviewer a commit with red applicable gates.
 - **Gate each new commit, not just the tip.** Run shared and focused checks on
-  every new commit in a stack with no later commits present. For a rewrite,
-  follow the rewrite skill.
+  every new commit in a stack with no later commits present; a renames-only
+  commit is exempt (see [Renames](#renames)). For a rewrite, follow the rewrite
+  skill.
 - **An independent code review precedes handoff.** Once the gates are green,
   the implementing agent spawns the reviewer itself, unasked. An unreviewed
   branch is not ready to hand off as finished. See [Code review](#code-review).
@@ -270,7 +274,7 @@ Three concrete shapes:
 
 Re-tagging deferred work as "remaining scope" / "stays open as followup" /
 "tracked separately" is paperwork, not progress. If you genuinely cannot finish
-a piece in this commit (a real dependency, an in-flight refactor elsewhere, a
+a piece in this stack (a real dependency, an in-flight refactor elsewhere, a
 deliberate incremental rollout), call out the specific blocker -- not just a
 hand-wave -- and confirm with the user that it's separable before deferring.
 
@@ -347,6 +351,56 @@ Each commit edits only what its own description calls for. Adjacent cleanup
 that "would be nice to do anyway" goes into a separate commit, OR is bumped
 into a new entry in the relevant tracking doc.
 
+### Break complex changes into small commits
+
+Deliver a complex change as a stack of small commits, never one large one. Each
+commit makes one behavior change and is small enough to review in one sitting.
+A large commit draws repeated review rounds: each fresh review reads the whole
+commit and finds another layer, and fixes made in crowded code introduce new
+defects. Small commits review faster and make regressions less likely and
+easier to trace.
+
+Size commits when planning, not after writing them. The plan for a complex
+change lists its commits in order, each with its one behavior change. A plan's
+outline item or phase is not a commit boundary: split one that changes more
+than one behavior, or one behavior across code paths that differ. Typical
+seams:
+
+- deletions, before updates to the code that survives them;
+- a behavior-neutral refactor, before the change it prepares;
+- a new helper with its tests, before its first caller;
+- each independent behavior change.
+
+A separate problem found while verifying a commit goes in its own commit, or in
+the earlier commit that introduced it; it does not grow the one under
+verification.
+
+Small means one behavior, not few lines. A behavior-neutral mechanical change,
+such as a symbol rename or a sweep across every caller, stays one commit
+however many sites it touches; do not add transitional aliases just to split
+it.
+
+Each commit is complete and merge-ready on its own: its audit is clean, its
+shared and focused gates are green, its review findings are resolved, and it
+carries its own tests and doc updates. Splitting does not relax
+[Finish the work everywhere it applies](#finish-the-work-everywhere-it-applies);
+the stack as a whole finishes the work.
+
+Never build on a commit that is not merge-ready. Finish each commit before
+starting the next, whether it lands first or merges with the rest of its stack;
+landing still takes the full suite and the user's merge approval, as any
+landing does. Everything above a broken commit is unmergeable until it is
+fixed, and each commit added on top makes the fix harder. When a commit turns
+out to be broken, stop adding commits and fix it first, through
+[Local commit-stack rewrites](#local-commit-stack-rewrites); if debugging it
+needs instrumentation, put that in its own commit beneath it. When a later
+design changes a commit that has not landed, rework that commit instead of
+stacking one that undoes part of it.
+
+A renames-only commit (see [Renames](#renames)) is the one exception: it need
+not be merge-ready alone, and its update commit is built directly on it. The
+two are merge-ready together.
+
 ### Stage explicit paths when hand-building a commit
 
 When staging a commit by hand -- an initial commit or an amend -- name each
@@ -375,8 +429,14 @@ fast-forward to `main` only after separate merge authorization.
 ### Renames
 
 When renaming and updating renamed files in git, do it in two commits. The
-first commit contains only renames (so git history tracking works across the
-rename). The second commit contains the actual file updates.
+first contains only the renames (`git mv`) and nothing else: no import or path
+fixes, no content edits, no deletions. It exists so git can track each rename,
+and any content change weakens the similarity match git tracks it by. It is
+expected to break code, docs, and tests. Because it is mechanical, it skips the
+audit, gates, and independent review; before building on it, confirm that
+`git show --format= --raw -M <commit>` lists only `R100` entries whose two
+modes match. The second commit, built directly on it, carries every update the
+rename needs and gets the full workflow.
 
 ## Commit-message hygiene
 
@@ -448,9 +508,10 @@ anyone is watching the parent.
 
 After its audit and a green pre-review gate, every agent-authored commit gets
 one independent review of that exact commit, doc-only and lint-config commits
-included, before user review and handoff. Complete the review before acting on
-its findings. Before deciding how to handle a finding, whether an amendment
-needs re-review, or how to handle later user feedback, read the skill's
+included, before user review and handoff. A renames-only commit is the one
+exemption (see [Renames](#renames)). Complete the review before acting on its
+findings. Before deciding how to handle a finding, whether an amendment needs
+re-review, or how to handle later user feedback, read the skill's
 `references/finding-disposition.md`.
 
 ### Standing authorization

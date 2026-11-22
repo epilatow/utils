@@ -1,15 +1,17 @@
 ---
 name: repo-shared-rewrite-local-commit-stack
 description: >-
-  Safely fold, amend, reorder, or replay local feature-branch commits without
-  git rebase or merge commits, using a backup branch and verified cherry-picks.
+  Safely fold, amend, split, reorder, or replay local feature-branch commits
+  without git rebase or merge commits, using a backup branch and verified
+  cherry-picks.
 ---
 
 # Rewrite a Local Commit Stack
 
-Use this procedure when an existing local feature-branch commit must be
-amended, a later local fix must be folded into its owning commit, local commits
-must be reordered, or the branch must be replayed onto a moved base.
+Use this procedure when an existing local feature-branch commit must be amended
+or split into smaller commits, a later local fix must be folded into its owning
+commit, local commits must be reordered, or the branch must be replayed onto a
+moved base.
 
 Repository instructions decide whether rewriting is authorized and which test
 and review gates follow it. This skill supplies the task-specific mechanics. It
@@ -89,6 +91,34 @@ or delete it during the operation.
 4. Verify each resulting commit remains complete, independently understandable,
    and free of changes owned by its descendants.
 
+### Split a commit
+
+1. With the worktree clean and the verified backup in place, reset the feature
+   branch to the parent of the commit being split with
+   `git -C "<feature-worktree-path>" reset --hard <split-commit>^`.
+
+2. Build each new commit in its planned order from that clean state. Take a
+   path's whole change from the split commit, including an addition or
+   deletion, with:
+
+   ```text
+   git -C "<feature-worktree-path>" restore --source=<split-commit> --staged --worktree -- <path>
+   ```
+
+   When a new commit takes only part of a file's change, edit the file to that
+   commit's content and stage it by name. Do not stage interactively. Commit
+   with nothing else in the worktree, so each new commit can be checked on its
+   own before the next is built.
+
+3. After the last new commit,
+   `git -C "<feature-worktree-path>" diff <split-commit>` must be empty for a
+   pure split, or show exactly any intentional content edit made with it.
+
+4. Verify each new commit is complete, independently understandable, and free
+   of changes owned by the commits after it. Then cherry-pick each original
+   descendant from the backup in its original order, using the recorded full
+   object IDs.
+
 ### Replay onto a moved base
 
 1. Resolve and record the exact new base commit.
@@ -128,25 +158,26 @@ make the state look clean.
 After the replay:
 
 1. Compare the new tip with the backup tip using `git diff <backup-branch>`.
-   For a pure reorder or fold, it must be empty. For an intentional content
-   edit, it must show exactly that edit. For a moved-base replay, it must show
-   exactly the new base's effect plus reviewed conflict resolutions.
+   For a pure reorder, fold, or split, it must be empty. For an intentional
+   content edit, it must show exactly that edit. For a moved-base replay, it
+   must show exactly the new base's effect plus reviewed conflict resolutions.
 2. Compare the recorded old and new commit sequences. For a moved-base replay,
    run `git range-diff <old-base>..<backup-branch> <new-base>..HEAD`; use the
-   analogous unchanged-base range for other rewrites when it clarifies folds or
-   reorders. Account explicitly for every old commit and every new commit: a
-   matching tip tree alone can hide a dropped, duplicated, or emptied commit.
+   analogous unchanged-base range for other rewrites when it clarifies folds,
+   splits, or reorders. Account explicitly for every old commit and every new
+   commit: a matching tip tree alone can hide a dropped, duplicated, or emptied
+   commit.
 3. Inspect the rewritten log and every rewritten commit. Confirm commit
    messages, attribution trailers, scope, and parent order.
 4. Reconfirm the feature branch name and a clean working tree.
 5. Assuming every backup commit had passed its applicable gates, run the shared
-   and focused checks for each changed, amended, or conflict-resolved commit as
-   it is reconstructed, before replaying its descendants. Run them on the
-   completed tip unless its tree and gate commands match an already-green exact
-   candidate. Unchanged commits need no rerun merely because their object IDs
-   changed. Do not start a full-suite or historical bisect over a documented
-   non-regression flake; investigate history only when evidence ties it to an
-   actual regression.
+   and focused checks for each changed, amended, split-off, or
+   conflict-resolved commit as it is reconstructed, before replaying its
+   descendants. Run them on the completed tip unless its tree and gate commands
+   match an already-green exact candidate. Unchanged commits need no rerun
+   merely because their object IDs changed. Do not start a full-suite or
+   historical bisect over a documented non-regression flake; investigate
+   history only when evidence ties it to an actual regression.
 6. Apply the repository's independent-review rules.
 
 Keep the backup branch until the user has accepted the rewritten stack or the

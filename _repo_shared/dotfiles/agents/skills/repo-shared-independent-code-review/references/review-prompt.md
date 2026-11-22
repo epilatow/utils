@@ -49,6 +49,11 @@ Answer two distinct questions, separately:
 1. Does the commit solve the problem it was supposed to
    solve? Is the diff in scope? Complete? Anything the
    authored intent called for that wasn't addressed?
+   Is the commit small: one behavior change, reviewable
+   in one sitting? Read `DEVELOPMENT_SHARED_AGENT.md`
+   "Break complex changes into small commits" for the
+   policy. Report a commit that should be split as a P2
+   finding that names the proposed commits.
 
 2. Did the commit avoid regressing or breaking anything
    else? Specifically:

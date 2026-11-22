@@ -1,8 +1,8 @@
 ---
 name: repo-shared-audit-committed-change
 description: >-
-  Audit one exact committed change in the implementing session for source and
-  test completeness and documentation impact before its test gates. This
+  Audit one exact committed change in the implementing session for size, source
+  and test completeness, and documentation impact before its test gates. This
   read-only audit never performs or satisfies independent code review.
 ---
 
@@ -48,9 +48,12 @@ basis, not from the working tree, because the working tree may represent a
 different commit or contain uncommitted changes. Flag an unrelated change, an
 omitted requirement, or an accidental deletion with concrete path evidence.
 
-Verify the commit message against the exact diff and check that the commit is
-cohesive. If it combines separable changes, split only when each result will be
-complete, independently understandable, and testable. Keep tightly coupled
+Verify the commit message against the exact diff. Check the commit's size under
+the repository's always-loaded small-commit rule and, when the plan lists
+commits, against this commit's entry. Flag a commit that makes more than one
+behavior change and name the proposed split; a plan outline item or phase is no
+reason to keep changes together. Each resulting commit must still be complete,
+independently understandable, and testable; keep tightly coupled
 implementation, tests, and documentation together.
 
 Check that the message claims no more than the commit delivers. Independent
@@ -111,6 +114,7 @@ Complete every check before reporting; do not stop at the first gap. Return:
 
 - the exact audited commit ID;
 - the request and plan used as scope sources;
+- commit-size findings;
 - source-completeness findings;
 - test-completeness findings;
 - documentation-impact findings;
@@ -118,10 +122,11 @@ Complete every check before reporting; do not stop at the first gap. Return:
 - an explicit statement that independent review remains outstanding.
 
 For each gap, name the path and unmet obligation and identify the smallest
-complete correction boundary. Do not use P1, P2, or P3 labels; those belong to
-independent review. Do not write a persistent review report.
+complete correction boundary. For a size finding, name each proposed commit's
+behavior change and the paths it takes. Do not use P1, P2, or P3 labels; those
+belong to independent review. Do not write a persistent review report.
 
 If findings exist, leave this skill, fix them through the normal implementation
-workflow, amend or rebuild the owning commit, and rerun this entire audit
-against the replacement exact commit before starting post-change tests. A clean
-result satisfies only the implementer's completeness-audit step.
+workflow, amend, rebuild, or split the owning commit, and rerun this entire
+audit against each replacement exact commit before starting its post-change
+tests. A clean result satisfies only the implementer's completeness-audit step.
