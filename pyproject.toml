@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "9edf34747dbb8ce78ae99af5890d1a7b686683f1" }
+epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "c68eb2ae8c60024db47561cc6ba5ca3f3a1cff6f" }
 
 [tool.mypy]
 # First-party shared packages live under src/ (e.g. `common`). The
